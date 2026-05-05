@@ -11,6 +11,7 @@ import pytest
 from cuda_opt_agent.agent.state import GraphState
 from cuda_opt_agent.models.data import (
     AgentConfig,
+    BlacklistEntry,
     BenchmarkResult,
     HardwareSpec,
     IterationRecord,
@@ -262,6 +263,91 @@ int main() { return 0; }
         }
         result = nodes.decide_node(state)
         assert result["should_stop"] is True
+        assert llm.invoke_json.call_count == 1
+
+    def test_decide_node_reselects_blacklisted_method(self, sample_agent_config,
+                                                      sample_operator_spec,
+                                                      sample_hardware_spec,
+                                                      sample_run_state,
+                                                      sample_benchmark_result):
+        nodes, sm, llm = self._make_nodes(sample_agent_config)
+        sm.state = sample_run_state
+        sample_run_state.blacklist.append(BlacklistEntry(
+            method_name_normalized="tiling",
+            reason="no speedup",
+        ))
+
+        llm.format_prompt.return_value = "test prompt"
+        llm.invoke_json.side_effect = [
+            {
+                "method_name": "tiling",
+                "has_hyperparams": False,
+                "rationale": "try again",
+                "expected_impact": "medium",
+                "confidence": 0.5,
+                "give_up": False,
+            },
+            {
+                "method_name": "warp_shuffle",
+                "has_hyperparams": False,
+                "rationale": "reduce shared memory traffic",
+                "expected_impact": "medium",
+                "confidence": 0.6,
+                "give_up": False,
+            },
+        ]
+
+        state: GraphState = {
+            "operator_spec": sample_operator_spec,
+            "hardware_spec": sample_hardware_spec,
+            "run_state": sample_run_state,
+            "current_benchmark": sample_benchmark_result,
+            "analysis_result": {},
+        }
+        result = nodes.decide_node(state)
+
+        assert "should_stop" not in result
+        assert result["method_decision"].method_name == "warp_shuffle"
+        assert llm.invoke_json.call_count == 2
+        assert "tiling" in llm.format_prompt.call_args_list[1].kwargs["rejected_methods"]
+
+    def test_decide_node_gives_up_after_reselect_retries_exhausted(self,
+                                                                  sample_agent_config,
+                                                                  sample_operator_spec,
+                                                                  sample_hardware_spec,
+                                                                  sample_run_state,
+                                                                  sample_benchmark_result):
+        config = sample_agent_config.model_copy(update={"decide_reselect_max_retries": 2})
+        nodes, sm, llm = self._make_nodes(config)
+        sm.state = sample_run_state
+        sample_run_state.blacklist.append(BlacklistEntry(
+            method_name_normalized="tiling",
+            reason="no speedup",
+        ))
+
+        llm.format_prompt.return_value = "test prompt"
+        llm.invoke_json.return_value = {
+            "method_name": "tiling",
+            "has_hyperparams": False,
+            "rationale": "still seems best",
+            "expected_impact": "medium",
+            "confidence": 0.5,
+            "give_up": False,
+        }
+
+        state: GraphState = {
+            "operator_spec": sample_operator_spec,
+            "hardware_spec": sample_hardware_spec,
+            "run_state": sample_run_state,
+            "current_benchmark": sample_benchmark_result,
+            "analysis_result": {},
+        }
+        result = nodes.decide_node(state)
+
+        assert result["should_stop"] is True
+        assert result["method_decision"].give_up is True
+        assert "exhausted decide reselection retries" in result["stop_reason"]
+        assert llm.invoke_json.call_count == 3
 
     def test_hp_search_compiles_all_candidates_before_gpu_work(self, sample_agent_config,
                                                                sample_operator_spec,

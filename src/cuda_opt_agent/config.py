@@ -45,6 +45,7 @@ def load_config(env_path: str | Path | None = None) -> AgentConfig:
         consecutive_reject_limit=int(os.getenv("CONSECUTIVE_REJECT_LIMIT", "5")),
         accept_epsilon=float(os.getenv("ACCEPT_EPSILON", "0.005")),
         compile_repair_max_retries=int(os.getenv("COMPILE_REPAIR_MAX_RETRIES", "3")),
+        decide_reselect_max_retries=int(os.getenv("DECIDE_RESELECT_MAX_RETRIES", "3")),
         hp_candidate_count=int(os.getenv("HP_CANDIDATE_COUNT", "5")),
         hp_compile_workers=int(os.getenv("HP_COMPILE_WORKERS", "0")),
         benchmark_warmup_rounds=int(os.getenv("BENCHMARK_WARMUP_ROUNDS", "10")),

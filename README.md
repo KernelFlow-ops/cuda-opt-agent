@@ -58,6 +58,7 @@ MAX_ITERATIONS=30
 CONSECUTIVE_REJECT_LIMIT=5
 ACCEPT_EPSILON=0.005
 COMPILE_REPAIR_MAX_RETRIES=3
+DECIDE_RESELECT_MAX_RETRIES=3
 HP_CANDIDATE_COUNT=5
 HP_COMPILE_WORKERS=0
 BENCHMARK_WARMUP_ROUNDS=10
@@ -290,6 +291,7 @@ cuda-opt show-run runs/gemm_run_20260501T120000
 | `MAX_ITERATIONS` | `--max-iters` | `30` | 最大迭代次数 |
 | `CONSECUTIVE_REJECT_LIMIT` | `--consecutive-reject-limit` | `5` | 连续拒绝后停止 |
 | `ACCEPT_EPSILON` | `--accept-epsilon` | `0.005` | 接受新版本所需相对提升 |
+| `DECIDE_RESELECT_MAX_RETRIES` | `--decide-reselect-max-retries` | `3` | decide 选中黑名单方法后的重选次数 |
 | `HP_CANDIDATE_COUNT` | `--hp-candidate-count` | `5` | 每轮超参候选数量 |
 | `HP_COMPILE_WORKERS` | `--hp-compile-workers` | `0` | HP 候选并行编译 worker 数；`0` 自动，`1` 串行 |
 | `MULTI_SHAPE_AGGREGATOR` | `--multi-shape-aggregator` | `mean` | 多 shape latency 聚合方式 |

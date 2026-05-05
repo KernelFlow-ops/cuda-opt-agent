@@ -108,6 +108,7 @@ def _apply_config_overrides(
     max_iters: int | None = None,
     consecutive_reject_limit: int | None = None,
     accept_epsilon: float | None = None,
+    decide_reselect_max_retries: int | None = None,
     hp_candidate_count: int | None = None,
     hp_compile_workers: int | None = None,
     multi_shape_aggregator: str | None = None,
@@ -120,6 +121,8 @@ def _apply_config_overrides(
         config.consecutive_reject_limit = consecutive_reject_limit
     if accept_epsilon is not None:
         config.accept_epsilon = accept_epsilon
+    if decide_reselect_max_retries is not None:
+        config.decide_reselect_max_retries = decide_reselect_max_retries
     if hp_candidate_count is not None:
         config.hp_candidate_count = hp_candidate_count
     if hp_compile_workers is not None:
@@ -335,6 +338,7 @@ def _load_config_with_overrides(
     max_iters: int | None,
     consecutive_reject_limit: int | None,
     accept_epsilon: float | None,
+    decide_reselect_max_retries: int | None,
     hp_candidate_count: int | None,
     hp_compile_workers: int | None,
     multi_shape_aggregator: str | None,
@@ -347,6 +351,7 @@ def _load_config_with_overrides(
         max_iters=max_iters,
         consecutive_reject_limit=consecutive_reject_limit,
         accept_epsilon=accept_epsilon,
+        decide_reselect_max_retries=decide_reselect_max_retries,
         hp_candidate_count=hp_candidate_count,
         hp_compile_workers=hp_compile_workers,
         multi_shape_aggregator=multi_shape_aggregator,
@@ -380,6 +385,11 @@ def new(
         "--accept-epsilon",
         help="Required relative improvement to accept a trial (defaults to ACCEPT_EPSILON in .env)",
     ),
+    decide_reselect_max_retries: Optional[int] = typer.Option(
+        None,
+        "--decide-reselect-max-retries",
+        help="Reselect when decide picks a blacklisted method (defaults to DECIDE_RESELECT_MAX_RETRIES in .env)",
+    ),
     hp_candidate_count: Optional[int] = typer.Option(
         None,
         "--hp-candidate-count",
@@ -408,6 +418,7 @@ def new(
         max_iters=max_iters,
         consecutive_reject_limit=consecutive_reject_limit,
         accept_epsilon=accept_epsilon,
+        decide_reselect_max_retries=decide_reselect_max_retries,
         hp_candidate_count=hp_candidate_count,
         hp_compile_workers=hp_compile_workers,
         multi_shape_aggregator=multi_shape_aggregator,
@@ -479,6 +490,11 @@ def tune(
         "--accept-epsilon",
         help="Required relative improvement to accept a trial (defaults to ACCEPT_EPSILON in .env)",
     ),
+    decide_reselect_max_retries: Optional[int] = typer.Option(
+        None,
+        "--decide-reselect-max-retries",
+        help="Reselect when decide picks a blacklisted method (defaults to DECIDE_RESELECT_MAX_RETRIES in .env)",
+    ),
     hp_candidate_count: Optional[int] = typer.Option(
         None,
         "--hp-candidate-count",
@@ -506,6 +522,7 @@ def tune(
         max_iters=max_iters,
         consecutive_reject_limit=consecutive_reject_limit,
         accept_epsilon=accept_epsilon,
+        decide_reselect_max_retries=decide_reselect_max_retries,
         hp_candidate_count=hp_candidate_count,
         hp_compile_workers=hp_compile_workers,
         multi_shape_aggregator=multi_shape_aggregator,
@@ -551,6 +568,11 @@ def run(
         "--accept-epsilon",
         help="Required relative improvement to accept a trial (defaults to ACCEPT_EPSILON in .env)",
     ),
+    decide_reselect_max_retries: Optional[int] = typer.Option(
+        None,
+        "--decide-reselect-max-retries",
+        help="Reselect when decide picks a blacklisted method (defaults to DECIDE_RESELECT_MAX_RETRIES in .env)",
+    ),
     hp_candidate_count: Optional[int] = typer.Option(
         None,
         "--hp-candidate-count",
@@ -579,6 +601,7 @@ def run(
         max_iters=max_iters,
         consecutive_reject_limit=consecutive_reject_limit,
         accept_epsilon=accept_epsilon,
+        decide_reselect_max_retries=decide_reselect_max_retries,
         hp_candidate_count=hp_candidate_count,
         hp_compile_workers=hp_compile_workers,
         multi_shape_aggregator=multi_shape_aggregator,

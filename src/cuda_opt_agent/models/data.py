@@ -170,6 +170,7 @@ class AgentConfig(BaseModel):
     consecutive_reject_limit: int = 5
     accept_epsilon: float = 0.005
     compile_repair_max_retries: int = 3
+    decide_reselect_max_retries: int = 3
     hp_candidate_count: int = 5
     hp_compile_workers: int = 0
     benchmark_warmup_rounds: int = 10

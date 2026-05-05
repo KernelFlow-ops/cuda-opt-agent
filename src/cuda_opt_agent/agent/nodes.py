@@ -455,27 +455,62 @@ class AgentNodes:
             f"per_shape: {self._per_shape_summary(bm).replace('<br>', '; ') or 'N/A'}"
         )
 
-        prompt = self.llm.format_prompt(
-            "decide_method.md",
-            operator_name=op.name,
-            operator_context=self._operator_context(op),
-            best_id=run_state.current_best_id,
-            benchmark_metrics=bm_text,
-            analysis_summary=json.dumps(analysis, ensure_ascii=False, indent=2),
-            blacklist=blacklist_text,
-            kb_hints=hints_text,
-            hardware_summary=self._hardware_summary(hw),
-        )
+        rejected_methods: list[tuple[str, str]] = []
 
-        decision_data = self.llm.invoke_json(prompt)
-        decision = MethodDecision.model_validate(decision_data)
+        def rejected_methods_text() -> str:
+            if not rejected_methods:
+                return "(none)"
+            return "\n".join(
+                f"  - {name} (normalized: {normalized})"
+                for name, normalized in rejected_methods
+            )
 
-        # 检查黑名单
-        if run_state.is_method_blacklisted(decision.method_name):
-            logger.warning("LLM selected blacklisted method %s; asking for reselection", decision.method_name)
-            # 可以在此做重试,简单起见标记 give_up
-            decision.give_up = True
-            decision.rationale += " [framework detected that this method is blacklisted]"
+        def build_prompt() -> str:
+            return self.llm.format_prompt(
+                "decide_method.md",
+                operator_name=op.name,
+                operator_context=self._operator_context(op),
+                best_id=run_state.current_best_id,
+                benchmark_metrics=bm_text,
+                analysis_summary=json.dumps(analysis, ensure_ascii=False, indent=2),
+                blacklist=blacklist_text,
+                rejected_methods=rejected_methods_text(),
+                kb_hints=hints_text,
+                hardware_summary=self._hardware_summary(hw),
+            )
+
+        decision: MethodDecision | None = None
+        max_reselects = max(0, self.sm.config.decide_reselect_max_retries)
+        for attempt in range(max_reselects + 1):
+            decision_data = self.llm.invoke_json(build_prompt())
+            decision = MethodDecision.model_validate(decision_data)
+
+            if decision.give_up:
+                break
+
+            if not run_state.is_method_blacklisted(decision.method_name):
+                break
+
+            normalized = normalize_method_name(decision.method_name)
+            rejected_methods.append((decision.method_name, normalized))
+            remaining = max_reselects - attempt
+            logger.warning(
+                "LLM selected blacklisted method %s (attempt %d/%d); %d reselections remaining",
+                decision.method_name,
+                attempt + 1,
+                max_reselects + 1,
+                remaining,
+            )
+            if remaining <= 0:
+                decision.give_up = True
+                decision.rationale += (
+                    " [framework exhausted decide reselection retries after repeated blacklisted methods: "
+                    + ", ".join(name for name, _ in rejected_methods)
+                    + "]"
+                )
+                break
+
+        assert decision is not None
 
         if decision.give_up:
             return {

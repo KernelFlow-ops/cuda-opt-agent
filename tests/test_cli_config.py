@@ -12,6 +12,7 @@ CONFIG_ENV_KEYS = [
     "MAX_ITERATIONS",
     "CONSECUTIVE_REJECT_LIMIT",
     "ACCEPT_EPSILON",
+    "DECIDE_RESELECT_MAX_RETRIES",
     "HP_CANDIDATE_COUNT",
     "HP_COMPILE_WORKERS",
     "MULTI_SHAPE_AGGREGATOR",
@@ -122,6 +123,7 @@ def test_run_uses_env_defaults_when_cli_options_omitted(tmp_dir, monkeypatch):
             "MAX_ITERATIONS=50",
             "CONSECUTIVE_REJECT_LIMIT=9",
             "ACCEPT_EPSILON=0.123",
+            "DECIDE_RESELECT_MAX_RETRIES=6",
             "HP_CANDIDATE_COUNT=8",
             "HP_COMPILE_WORKERS=3",
         ]),
@@ -136,6 +138,7 @@ def test_run_uses_env_defaults_when_cli_options_omitted(tmp_dir, monkeypatch):
     assert config.max_iterations == 50
     assert config.consecutive_reject_limit == 9
     assert config.accept_epsilon == pytest.approx(0.123)
+    assert config.decide_reselect_max_retries == 6
     assert config.hp_candidate_count == 8
     assert config.hp_compile_workers == 3
     assert set(op_spec.dtypes.values()) == {"bf16"}
@@ -151,6 +154,7 @@ def test_run_cli_options_override_env_defaults(tmp_dir, monkeypatch):
             "MAX_ITERATIONS=50",
             "CONSECUTIVE_REJECT_LIMIT=9",
             "ACCEPT_EPSILON=0.123",
+            "DECIDE_RESELECT_MAX_RETRIES=6",
             "HP_CANDIDATE_COUNT=8",
             "HP_COMPILE_WORKERS=3",
         ]),
@@ -170,6 +174,8 @@ def test_run_cli_options_override_env_defaults(tmp_dir, monkeypatch):
             "2",
             "--accept-epsilon",
             "0.01",
+            "--decide-reselect-max-retries",
+            "2",
             "--hp-candidate-count",
             "4",
             "--hp-compile-workers",
@@ -183,6 +189,7 @@ def test_run_cli_options_override_env_defaults(tmp_dir, monkeypatch):
     assert config.max_iterations == 7
     assert config.consecutive_reject_limit == 2
     assert config.accept_epsilon == pytest.approx(0.01)
+    assert config.decide_reselect_max_retries == 2
     assert config.hp_candidate_count == 4
     assert config.hp_compile_workers == 2
     assert set(op_spec.dtypes.values()) == {"fp32"}
