@@ -13,6 +13,7 @@ CONFIG_ENV_KEYS = [
     "CONSECUTIVE_REJECT_LIMIT",
     "ACCEPT_EPSILON",
     "HP_CANDIDATE_COUNT",
+    "HP_COMPILE_WORKERS",
     "MULTI_SHAPE_AGGREGATOR",
 ]
 
@@ -122,6 +123,7 @@ def test_run_uses_env_defaults_when_cli_options_omitted(tmp_dir, monkeypatch):
             "CONSECUTIVE_REJECT_LIMIT=9",
             "ACCEPT_EPSILON=0.123",
             "HP_CANDIDATE_COUNT=8",
+            "HP_COMPILE_WORKERS=3",
         ]),
         encoding="utf-8",
     )
@@ -135,6 +137,7 @@ def test_run_uses_env_defaults_when_cli_options_omitted(tmp_dir, monkeypatch):
     assert config.consecutive_reject_limit == 9
     assert config.accept_epsilon == pytest.approx(0.123)
     assert config.hp_candidate_count == 8
+    assert config.hp_compile_workers == 3
     assert set(op_spec.dtypes.values()) == {"bf16"}
     assert "Max iterations: 50" in result.output
 
@@ -149,6 +152,7 @@ def test_run_cli_options_override_env_defaults(tmp_dir, monkeypatch):
             "CONSECUTIVE_REJECT_LIMIT=9",
             "ACCEPT_EPSILON=0.123",
             "HP_CANDIDATE_COUNT=8",
+            "HP_COMPILE_WORKERS=3",
         ]),
         encoding="utf-8",
     )
@@ -168,6 +172,8 @@ def test_run_cli_options_override_env_defaults(tmp_dir, monkeypatch):
             "0.01",
             "--hp-candidate-count",
             "4",
+            "--hp-compile-workers",
+            "2",
         ],
     )
 
@@ -178,6 +184,7 @@ def test_run_cli_options_override_env_defaults(tmp_dir, monkeypatch):
     assert config.consecutive_reject_limit == 2
     assert config.accept_epsilon == pytest.approx(0.01)
     assert config.hp_candidate_count == 4
+    assert config.hp_compile_workers == 2
     assert set(op_spec.dtypes.values()) == {"fp32"}
     assert "Max iterations: 7" in result.output
 

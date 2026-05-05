@@ -59,6 +59,7 @@ CONSECUTIVE_REJECT_LIMIT=5
 ACCEPT_EPSILON=0.005
 COMPILE_REPAIR_MAX_RETRIES=3
 HP_CANDIDATE_COUNT=5
+HP_COMPILE_WORKERS=0
 BENCHMARK_WARMUP_ROUNDS=10
 BENCHMARK_MEASURE_ROUNDS=100
 MULTI_SHAPE_AGGREGATOR=mean
@@ -237,6 +238,12 @@ cuda-opt tune <file.cu> [OPTIONS]
 ./kernel --warmup 10 --rounds 100 --shape B=4096 N=4096
 ```
 
+### HP 候选并发
+
+HP search 阶段会先串行让 LLM 生成各候选代码，然后并行执行 nvcc 编译。编译成功后，correctness 和 benchmark 仍然串行执行，避免同一张 GPU 上并发运行导致校验/测速互相干扰。
+
+`HP_COMPILE_WORKERS=0` 表示自动使用 `min(候选数, CPU 核数)`；设置为 `1` 可关闭并发，便于调试。
+
 ### 续跑
 
 ```bash
@@ -284,6 +291,7 @@ cuda-opt show-run runs/gemm_run_20260501T120000
 | `CONSECUTIVE_REJECT_LIMIT` | `--consecutive-reject-limit` | `5` | 连续拒绝后停止 |
 | `ACCEPT_EPSILON` | `--accept-epsilon` | `0.005` | 接受新版本所需相对提升 |
 | `HP_CANDIDATE_COUNT` | `--hp-candidate-count` | `5` | 每轮超参候选数量 |
+| `HP_COMPILE_WORKERS` | `--hp-compile-workers` | `0` | HP 候选并行编译 worker 数；`0` 自动，`1` 串行 |
 | `MULTI_SHAPE_AGGREGATOR` | `--multi-shape-aggregator` | `mean` | 多 shape latency 聚合方式 |
 
 仅 `.env` 配置项:

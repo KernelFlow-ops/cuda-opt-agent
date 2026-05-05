@@ -109,6 +109,7 @@ def _apply_config_overrides(
     consecutive_reject_limit: int | None = None,
     accept_epsilon: float | None = None,
     hp_candidate_count: int | None = None,
+    hp_compile_workers: int | None = None,
     multi_shape_aggregator: str | None = None,
 ) -> None:
     if dtype is not None:
@@ -121,6 +122,8 @@ def _apply_config_overrides(
         config.accept_epsilon = accept_epsilon
     if hp_candidate_count is not None:
         config.hp_candidate_count = hp_candidate_count
+    if hp_compile_workers is not None:
+        config.hp_compile_workers = hp_compile_workers
     if multi_shape_aggregator is not None:
         config.multi_shape_aggregator = multi_shape_aggregator
 
@@ -333,6 +336,7 @@ def _load_config_with_overrides(
     consecutive_reject_limit: int | None,
     accept_epsilon: float | None,
     hp_candidate_count: int | None,
+    hp_compile_workers: int | None,
     multi_shape_aggregator: str | None,
 ) -> AgentConfig:
     config = load_config(env_file)
@@ -344,6 +348,7 @@ def _load_config_with_overrides(
         consecutive_reject_limit=consecutive_reject_limit,
         accept_epsilon=accept_epsilon,
         hp_candidate_count=hp_candidate_count,
+        hp_compile_workers=hp_compile_workers,
         multi_shape_aggregator=multi_shape_aggregator,
     )
     return config
@@ -380,6 +385,11 @@ def new(
         "--hp-candidate-count",
         help="Hyperparameter candidates per search (defaults to HP_CANDIDATE_COUNT in .env)",
     ),
+    hp_compile_workers: Optional[int] = typer.Option(
+        None,
+        "--hp-compile-workers",
+        help="Parallel HP candidate compile workers (defaults to HP_COMPILE_WORKERS in .env; 0=auto, 1=serial)",
+    ),
     multi_shape_aggregator: Optional[str] = typer.Option(
         None,
         "--multi-shape-aggregator",
@@ -399,6 +409,7 @@ def new(
         consecutive_reject_limit=consecutive_reject_limit,
         accept_epsilon=accept_epsilon,
         hp_candidate_count=hp_candidate_count,
+        hp_compile_workers=hp_compile_workers,
         multi_shape_aggregator=multi_shape_aggregator,
     )
 
@@ -473,6 +484,11 @@ def tune(
         "--hp-candidate-count",
         help="Hyperparameter candidates per search (defaults to HP_CANDIDATE_COUNT in .env)",
     ),
+    hp_compile_workers: Optional[int] = typer.Option(
+        None,
+        "--hp-compile-workers",
+        help="Parallel HP candidate compile workers (defaults to HP_COMPILE_WORKERS in .env; 0=auto, 1=serial)",
+    ),
     multi_shape_aggregator: Optional[str] = typer.Option(
         None,
         "--multi-shape-aggregator",
@@ -491,6 +507,7 @@ def tune(
         consecutive_reject_limit=consecutive_reject_limit,
         accept_epsilon=accept_epsilon,
         hp_candidate_count=hp_candidate_count,
+        hp_compile_workers=hp_compile_workers,
         multi_shape_aggregator=multi_shape_aggregator,
     )
     try:
@@ -539,6 +556,11 @@ def run(
         "--hp-candidate-count",
         help="Hyperparameter candidates per search (defaults to HP_CANDIDATE_COUNT in .env)",
     ),
+    hp_compile_workers: Optional[int] = typer.Option(
+        None,
+        "--hp-compile-workers",
+        help="Parallel HP candidate compile workers (defaults to HP_COMPILE_WORKERS in .env; 0=auto, 1=serial)",
+    ),
     multi_shape_aggregator: Optional[str] = typer.Option(
         None,
         "--multi-shape-aggregator",
@@ -558,6 +580,7 @@ def run(
         consecutive_reject_limit=consecutive_reject_limit,
         accept_epsilon=accept_epsilon,
         hp_candidate_count=hp_candidate_count,
+        hp_compile_workers=hp_compile_workers,
         multi_shape_aggregator=multi_shape_aggregator,
     )
     op_spec = _operator_spec_from_fields(

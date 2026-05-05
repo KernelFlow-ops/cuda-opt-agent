@@ -238,8 +238,8 @@ int main() { return 0; }
         assert result["has_hyperparams"] is True
 
     def test_decide_node_give_up(self, sample_agent_config, sample_operator_spec,
-                                  sample_hardware_spec, sample_run_state,
-                                  sample_benchmark_result):
+                                 sample_hardware_spec, sample_run_state,
+                                 sample_benchmark_result):
         nodes, sm, llm = self._make_nodes(sample_agent_config)
         sm.state = sample_run_state
 
@@ -262,6 +262,76 @@ int main() { return 0; }
         }
         result = nodes.decide_node(state)
         assert result["should_stop"] is True
+
+    def test_hp_search_compiles_all_candidates_before_gpu_work(self, sample_agent_config,
+                                                               sample_operator_spec,
+                                                               sample_hardware_spec,
+                                                               sample_run_state):
+        config = sample_agent_config.model_copy(update={"hp_compile_workers": 1})
+        nodes, sm, llm = self._make_nodes(config)
+        sm.state = sample_run_state
+        sm.run_dir = sm.persistence.create_run_dir("test")
+
+        llm.format_prompt.return_value = "prompt"
+        llm.invoke_json.return_value = [
+            {"index": 0, "hyperparams": {"tile": 64}, "rationale": "safe"},
+            {"index": 1, "hyperparams": {"tile": 128}, "rationale": "fast"},
+        ]
+        llm.invoke.side_effect = [
+            "```cuda\n__global__ void k0() {}\n```",
+            "```cuda\n__global__ void k1() {}\n```",
+        ]
+        events = []
+
+        from cuda_opt_agent.tools.compile import CompileResult
+        from cuda_opt_agent.tools.correctness import CorrectnessResult
+
+        def fake_compile(code_path, output_path, compute_capability):
+            events.append(("compile", str(code_path)))
+            return CompileResult(success=True, output_path=str(output_path), stdout="ok", stderr="", return_code=0)
+
+        def fake_correctness(exe_path, shape_profiles, dtype):
+            events.append(("check", str(exe_path)))
+            return [{"correct": True, "message": "ok"}]
+
+        def fake_benchmark(exe_path, op):
+            events.append(("bench", str(exe_path)))
+            latency = 2.0 if len([e for e in events if e[0] == "bench"]) == 1 else 1.0
+            return BenchmarkResult(latency_ms_median=latency, latency_ms_p95=latency)
+
+        state: GraphState = {
+            "operator_spec": sample_operator_spec,
+            "hardware_spec": sample_hardware_spec,
+            "run_state": sample_run_state,
+            "current_ncu": NcuMetrics(),
+            "current_code": "__global__ void base() {}",
+            "method_decision": MethodDecision(
+                method_name="tiling",
+                has_hyperparams=True,
+                hyperparams_schema={"tile": {"type": "int"}},
+            ),
+        }
+
+        with patch("cuda_opt_agent.agent.nodes.compile_cuda", side_effect=fake_compile), \
+             patch("cuda_opt_agent.agent.nodes.check_correctness_multi", side_effect=fake_correctness), \
+             patch.object(nodes, "_benchmark_multi", side_effect=fake_benchmark):
+            result = nodes.hp_search_node(state)
+
+        event_types = [event[0] for event in events]
+        assert event_types == ["compile", "compile", "check", "bench", "check", "bench"]
+        assert result["trial_benchmark"].latency_ms_median == 1.0
+        assert result["new_version_id"].endswith("cand1")
+
+    def test_hp_compile_worker_count_auto_uses_cpu_limit(self, sample_agent_config):
+        config = sample_agent_config.model_copy(update={"hp_compile_workers": 0})
+        nodes, _, _ = self._make_nodes(config)
+
+        with patch("cuda_opt_agent.agent.nodes.os.cpu_count", return_value=8):
+            assert nodes._hp_compile_worker_count(5) == 5
+
+        config = sample_agent_config.model_copy(update={"hp_compile_workers": 2})
+        nodes, _, _ = self._make_nodes(config)
+        assert nodes._hp_compile_worker_count(5) == 2
 
     def test_evaluate_ignores_stale_trial_benchmark(self, sample_agent_config,
                                                      sample_operator_spec,

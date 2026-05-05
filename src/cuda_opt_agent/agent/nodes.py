@@ -4,8 +4,10 @@ LangGraph 节点实现 —— 每个节点对应技术总纲 §3.1 的一个职�
 
 from __future__ import annotations
 
+import os
 import json
 import logging
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +34,37 @@ from .llm_client import LLMClient
 from .state import GraphState
 
 logger = logging.getLogger(__name__)
+
+
+def _compile_hp_candidate_job(job: dict[str, Any]) -> dict[str, Any]:
+    """Compile one HP candidate in a worker process."""
+    result = {
+        "index": job["index"],
+        "version_id": job["version_id"],
+        "iter_dir": job["iter_dir"],
+        "code_path": job["code_path"],
+        "success": False,
+        "output_path": "",
+        "stdout": "",
+        "stderr": "",
+        "return_code": -1,
+    }
+    try:
+        cr = compile_cuda(
+            job["code_path"],
+            job["output_path"],
+            job["compute_capability"],
+        )
+        result.update({
+            "success": cr.success,
+            "output_path": cr.output_path,
+            "stdout": cr.stdout,
+            "stderr": cr.stderr,
+            "return_code": cr.return_code,
+        })
+    except Exception as e:
+        result["stderr"] = f"Compilation worker error: {e}"
+    return result
 
 
 class AgentNodes:
@@ -110,6 +143,29 @@ class AgentNodes:
         if len(bm.extra["per_shape"]) > limit:
             parts.append(f"+{len(bm.extra['per_shape']) - limit} more")
         return "<br>".join(parts)
+
+    def _hp_compile_worker_count(self, job_count: int) -> int:
+        if job_count <= 1:
+            return 1
+        configured = self.sm.config.hp_compile_workers
+        if configured == 1:
+            return 1
+        if configured and configured > 1:
+            return min(job_count, configured)
+        return min(job_count, os.cpu_count() or 1)
+
+    def _compile_hp_candidates(self, jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        worker_count = self._hp_compile_worker_count(len(jobs))
+        if worker_count <= 1:
+            return [_compile_hp_candidate_job(job) for job in jobs]
+
+        logger.info("Compiling %d HP candidates with %d workers", len(jobs), worker_count)
+        try:
+            with ProcessPoolExecutor(max_workers=worker_count) as executor:
+                return list(executor.map(_compile_hp_candidate_job, jobs))
+        except Exception as e:
+            logger.warning("Parallel HP compilation failed; falling back to serial compile: %s", e)
+            return [_compile_hp_candidate_job(job) for job in jobs]
 
     # ════════════════════════════════════════
     # INIT
@@ -466,8 +522,9 @@ class AgentNodes:
             if isinstance(item, dict):
                 candidates.append(HyperparamCandidate.model_validate(item))
 
-        # 对每组候选生成代码、编译、校验、测速
-        results = []
+        # 先串行生成代码并落盘,再并行编译;GPU 校验和测速必须保持串行。
+        candidate_records: dict[str, dict[str, Any]] = {}
+        compile_jobs: list[dict[str, Any]] = []
         version_base = state["run_state"].next_version_id(has_hp=True)
 
         for cand in candidates:
@@ -493,12 +550,36 @@ class AgentNodes:
             code = extract_cuda_code(response)
             code_path = self.sm.persistence.save_code(code, iter_dir)
 
-            # 编译
-            cr = compile_cuda(code_path, iter_dir / "kernel", hw.compute_capability)
-            if not cr.success:
-                logger.warning("Candidate %d compilation failed", cand.index)
+            candidate_records[version_id] = {
+                "candidate": cand,
+                "code": code,
+                "iter_dir": iter_dir,
+            }
+            compile_jobs.append({
+                "index": cand.index,
+                "version_id": version_id,
+                "iter_dir": str(iter_dir),
+                "code_path": str(code_path),
+                "output_path": str(iter_dir / "kernel"),
+                "compute_capability": hw.compute_capability,
+            })
+
+        results = []
+        compiled_candidates = self._compile_hp_candidates(compile_jobs)
+
+        for compiled in compiled_candidates:
+            version_id = compiled["version_id"]
+            record = candidate_records[version_id]
+            cand = record["candidate"]
+            iter_dir = Path(record["iter_dir"])
+
+            compile_output = (compiled.get("stdout", "") + "\n" + compiled.get("stderr", "")).strip()
+            (iter_dir / "compile.log").write_text(compile_output, encoding="utf-8")
+
+            if not compiled.get("success"):
+                logger.warning("Candidate %d compilation failed: %s", cand.index, compiled.get("stderr", "")[:500])
                 continue
-            exe_path = Path(cr.output_path)
+            exe_path = Path(compiled["output_path"])
 
             # 校验
             dtype = list(op.dtypes.values())[0] if op.dtypes else "fp32"
@@ -514,7 +595,7 @@ class AgentNodes:
                 "version_id": version_id,
                 "hyperparams": cand.hyperparams,
                 "benchmark": bm,
-                "code": code,
+                "code": record["code"],
                 "iter_dir": str(iter_dir),
             })
 

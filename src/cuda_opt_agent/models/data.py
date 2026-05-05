@@ -171,6 +171,7 @@ class AgentConfig(BaseModel):
     accept_epsilon: float = 0.005
     compile_repair_max_retries: int = 3
     hp_candidate_count: int = 5
+    hp_compile_workers: int = 0
     benchmark_warmup_rounds: int = 10
     benchmark_measure_rounds: int = 100
     multi_shape_aggregator: Literal["mean", "worst", "weighted"] = "mean"
