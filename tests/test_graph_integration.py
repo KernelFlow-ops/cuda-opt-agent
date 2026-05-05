@@ -238,6 +238,50 @@ int main() { return 0; }
         assert result["method_decision"].method_name == "shared_memory_tiling"
         assert result["has_hyperparams"] is True
 
+    def test_decide_node_includes_method_hp_history(self, sample_agent_config,
+                                                    sample_operator_spec,
+                                                    sample_hardware_spec,
+                                                    sample_run_state,
+                                                    sample_benchmark_result):
+        nodes, sm, llm = self._make_nodes(sample_agent_config)
+        sm.state = sample_run_state
+        sample_run_state.iterations.append(IterationRecord(
+            version_id="v1_hp_cand0",
+            parent_id="v0",
+            method_name="tiling",
+            has_hyperparams=True,
+            hyperparams={"tile": 128, "k": 32},
+            compile_ok=True,
+            correctness_ok=True,
+            benchmark=BenchmarkResult(latency_ms_median=1.5, latency_ms_p95=1.6),
+            accepted=False,
+        ))
+
+        llm.format_prompt.return_value = "test prompt"
+        llm.invoke_json.return_value = {
+            "method_name": "shared_memory_tiling",
+            "has_hyperparams": True,
+            "hyperparams_schema": {"tile": {"type": "int"}},
+            "rationale": "DRAM bound",
+            "expected_impact": "high",
+            "confidence": 0.8,
+            "give_up": False,
+        }
+
+        state: GraphState = {
+            "operator_spec": sample_operator_spec,
+            "hardware_spec": sample_hardware_spec,
+            "run_state": sample_run_state,
+            "current_benchmark": sample_benchmark_result,
+            "analysis_result": {},
+        }
+        nodes.decide_node(state)
+
+        method_history = llm.format_prompt.call_args.kwargs["method_history"]
+        assert "v1_hp_cand0" in method_history
+        assert '"tile": 128' in method_history
+        assert "1.5000 ms" in method_history
+
     def test_decide_node_give_up(self, sample_agent_config, sample_operator_spec,
                                  sample_hardware_spec, sample_run_state,
                                  sample_benchmark_result):
@@ -407,6 +451,81 @@ int main() { return 0; }
         assert event_types == ["compile", "compile", "check", "bench", "check", "bench"]
         assert result["trial_benchmark"].latency_ms_median == 1.0
         assert result["new_version_id"].endswith("cand1")
+
+    def test_hp_search_includes_known_hp_trials(self, sample_agent_config,
+                                                sample_operator_spec,
+                                                sample_hardware_spec,
+                                                sample_run_state):
+        nodes, sm, llm = self._make_nodes(sample_agent_config)
+        sm.state = sample_run_state
+        sample_run_state.iterations.append(IterationRecord(
+            version_id="v1_hp_cand0",
+            parent_id="v0",
+            method_name="tiling",
+            has_hyperparams=True,
+            hyperparams={"tile": 128},
+            compile_ok=True,
+            correctness_ok=False,
+            accepted=False,
+        ))
+
+        llm.format_prompt.return_value = "prompt"
+        llm.invoke_json.return_value = []
+
+        state: GraphState = {
+            "operator_spec": sample_operator_spec,
+            "hardware_spec": sample_hardware_spec,
+            "run_state": sample_run_state,
+            "current_ncu": NcuMetrics(),
+            "current_code": "__global__ void base() {}",
+            "method_decision": MethodDecision(
+                method_name="tiling",
+                has_hyperparams=True,
+                hyperparams_schema={"tile": {"type": "int"}},
+            ),
+        }
+        nodes.hp_search_node(state)
+
+        known_hp_trials = llm.format_prompt.call_args.kwargs["known_hp_trials"]
+        assert "v1_hp_cand0" in known_hp_trials
+        assert '"tile": 128' in known_hp_trials
+        assert "failed correctness" in known_hp_trials
+
+    def test_reflect_records_selected_hp_candidate(self, sample_agent_config,
+                                                   sample_operator_spec,
+                                                   sample_hardware_spec,
+                                                   sample_run_state):
+        nodes, sm, llm = self._make_nodes(sample_agent_config)
+        sm.state = sample_run_state
+        sm.run_dir = sm.persistence.create_run_dir("test")
+        llm.format_prompt.return_value = "prompt"
+        llm.invoke_json.return_value = {"why_ineffective": "no speedup"}
+
+        state: GraphState = {
+            "operator_spec": sample_operator_spec,
+            "hardware_spec": sample_hardware_spec,
+            "run_state": sample_run_state,
+            "method_decision": MethodDecision(method_name="tiling", has_hyperparams=True),
+            "current_benchmark": BenchmarkResult(latency_ms_median=1.0, latency_ms_p95=1.0),
+            "trial_benchmark": BenchmarkResult(latency_ms_median=1.2, latency_ms_p95=1.3),
+            "new_version_id": "v1_hp_cand0",
+            "trial_compile_ok": True,
+            "trial_correctness_ok": True,
+            "trial_accepted": False,
+            "hp_candidates": [
+                {
+                    "version_id": "v1_hp_cand0",
+                    "hyperparams": {"tile": 128, "k": 32},
+                }
+            ],
+        }
+        nodes.reflect_node(state)
+
+        record = sample_run_state.iter_by_id("v1_hp_cand0")
+        assert record is not None
+        assert record.hyperparams == {"tile": 128, "k": 32}
+        assert sample_run_state.blacklist[-1].hyperparam_constraint == {"tile": 128, "k": 32}
+        assert '{"k": 32, "tile": 128}' in llm.format_prompt.call_args.kwargs["hyperparams"]
 
     def test_hp_compile_worker_count_auto_uses_cpu_limit(self, sample_agent_config):
         config = sample_agent_config.model_copy(update={"hp_compile_workers": 0})

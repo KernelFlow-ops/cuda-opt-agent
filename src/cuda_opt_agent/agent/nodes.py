@@ -144,6 +144,56 @@ class AgentNodes:
             parts.append(f"+{len(bm.extra['per_shape']) - limit} more")
         return "<br>".join(parts)
 
+    @staticmethod
+    def _iteration_outcome_text(iteration: IterationRecord) -> str:
+        if not iteration.compile_ok:
+            return "compile failed"
+        if not iteration.correctness_ok:
+            return "failed correctness"
+        if iteration.benchmark:
+            return f"{iteration.benchmark.latency_ms_median:.4f} ms"
+        return "no benchmark"
+
+    @staticmethod
+    def _hyperparams_text(hyperparams: dict[str, Any] | None) -> str:
+        if not hyperparams:
+            return "none"
+        return json.dumps(hyperparams, ensure_ascii=False, sort_keys=True)
+
+    def _method_history_text(self, run_state, method_name: str | None = None, limit: int = 20) -> str:
+        target = normalize_method_name(method_name) if method_name else None
+        rows = []
+        for iteration in run_state.iterations:
+            if not iteration.method_name:
+                continue
+            normalized = normalize_method_name(iteration.method_name)
+            if target and normalized != target:
+                continue
+            rows.append(
+                "| {version} | {method} | {hyperparams} | {outcome} | {accepted} |".format(
+                    version=iteration.version_id,
+                    method=iteration.method_name,
+                    hyperparams=self._hyperparams_text(iteration.hyperparams),
+                    outcome=self._iteration_outcome_text(iteration),
+                    accepted="yes" if iteration.accepted else "no",
+                )
+            )
+
+        if not rows:
+            return "(none)"
+        rows = rows[-limit:]
+        header = "| version | method | hyperparams | outcome | accepted |\n|---|---|---|---|---|"
+        return header + "\n" + "\n".join(rows)
+
+    @staticmethod
+    def _selected_hyperparams(state: GraphState) -> dict[str, Any] | None:
+        version_id = state.get("new_version_id") or state.get("trial_version_id")
+        for item in state.get("hp_candidates", []) or []:
+            if isinstance(item, dict) and item.get("version_id") == version_id:
+                hyperparams = item.get("hyperparams")
+                return hyperparams if isinstance(hyperparams, dict) else None
+        return None
+
     def _hp_compile_worker_count(self, job_count: int) -> int:
         if job_count <= 1:
             return 1
@@ -474,6 +524,7 @@ class AgentNodes:
                 benchmark_metrics=bm_text,
                 analysis_summary=json.dumps(analysis, ensure_ascii=False, indent=2),
                 blacklist=blacklist_text,
+                method_history=self._method_history_text(run_state),
                 rejected_methods=rejected_methods_text(),
                 kb_hints=hints_text,
                 hardware_summary=self._hardware_summary(hw),
@@ -543,6 +594,7 @@ class AgentNodes:
             method_name=decision.method_name,
             method_rationale=decision.rationale,
             hyperparams_schema=json.dumps(decision.hyperparams_schema or {}, indent=2),
+            known_hp_trials=self._method_history_text(state["run_state"], decision.method_name),
             ncu_key_metrics=format_ncu_for_prompt(ncu)[:3000],
             hardware_summary=self._hardware_summary(hw),
             hp_count=self.sm.config.hp_candidate_count,
@@ -772,6 +824,8 @@ class AgentNodes:
 
         trial_bm = state.get("trial_benchmark") or BenchmarkResult()
         best_bm = state.get("current_benchmark") or BenchmarkResult()
+        selected_hyperparams = self._selected_hyperparams(state)
+        selected_hyperparams_text = self._hyperparams_text(selected_hyperparams)
 
         if accepted:
             speedup = (best_bm.latency_ms_median / trial_bm.latency_ms_median
@@ -780,7 +834,7 @@ class AgentNodes:
             prompt = self.llm.format_prompt(
                 "reflect_success.md",
                 method_name=decision.method_name,
-                hyperparams=json.dumps(decision.hyperparams_schema) if decision.has_hyperparams else "none",
+                hyperparams=selected_hyperparams_text if decision.has_hyperparams else "none",
                 parent_id=run_state.current_best_id,
                 parent_latency_ms=best_bm.latency_ms_median,
                 new_id=state.get("new_version_id", "?"),
@@ -792,7 +846,7 @@ class AgentNodes:
             prompt = self.llm.format_prompt(
                 "reflect_failure.md",
                 method_name=decision.method_name,
-                hyperparams=json.dumps(decision.hyperparams_schema) if decision.has_hyperparams else "none",
+                hyperparams=selected_hyperparams_text if decision.has_hyperparams else "none",
                 best_id=run_state.current_best_id,
                 best_latency_ms=best_bm.latency_ms_median,
                 trial_id=state.get("new_version_id", "?"),
@@ -815,6 +869,7 @@ class AgentNodes:
             parent_id=run_state.current_best_id,
             method_name=decision.method_name,
             has_hyperparams=decision.has_hyperparams,
+            hyperparams=selected_hyperparams,
             code_path=code_path,
             benchmark=trial_bm if trial_bm.latency_ms_median > 0 else None,
             compile_ok=state.get("trial_compile_ok", False),
@@ -847,6 +902,7 @@ class AgentNodes:
             self.sm.add_to_blacklist(
                 method_name=decision.method_name,
                 reason=reflection.get("why_ineffective", "unknown"),
+                hp_constraint=selected_hyperparams if decision.has_hyperparams else None,
                 failed_at_version=version_id,
             )
 
