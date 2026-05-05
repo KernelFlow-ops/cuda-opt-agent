@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+
+[project]
+name = "cuda-opt-agent"
+version = "0.1.0"
+description = "LLM-driven CUDA operator optimization agent"
+requires-python = ">=3.10"
+dependencies = [
+    "langchain>=0.3",
+    "langchain-anthropic>=0.3",
+    "langchain-openai>=0.2",
+    "langgraph>=0.2",
+    "pydantic>=2.7",
+    "rich>=13.7",
+    "textual>=0.70",
+    "typer>=0.12",
+    "pynvml>=11.5",
+    "orjson>=3.10",
+    "tenacity>=8.3",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-mock>=3.12",
+    "pytest-cov>=5.0",
+]
+
+[project.scripts]
+cuda-opt = "cuda_opt_agent.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "slow: marks tests as slow",
+    "gpu: requires GPU",
+    "api: requires LLM API key",
+]
