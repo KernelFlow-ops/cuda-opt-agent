@@ -1,5 +1,8 @@
 你正在优化一个 CUDA {operator_name} 算子。请在当前最佳版本基础上应用以下优化方法。
 
+## 任务上下文
+{operator_context}
+
 ## 优化方法
 - 方法名: {method_name}
 - 理由: {method_rationale}

@@ -49,6 +49,32 @@ class AgentNodes:
         self.kb = kb
         self.llm = llm
 
+    @staticmethod
+    def _operator_context(op) -> str:
+        """Format task semantics once so every optimization prompt sees the same context."""
+        lines = [
+            f"- Signature: {op.signature or '(none)'}",
+            f"- Dtypes: {json.dumps(op.dtypes, ensure_ascii=False)}",
+            f"- Shapes: {json.dumps(op.shapes, ensure_ascii=False)}",
+        ]
+        if op.shape_profiles:
+            lines.append(f"- Shape profiles: {json.dumps(op.shape_profiles, ensure_ascii=False)}")
+        if op.task_description:
+            lines.append(f"- Task description: {op.task_description}")
+        if op.constraints:
+            lines.append("- Constraints:\n  " + "\n  ".join(op.constraints))
+        if op.seed_code_path:
+            lines.append(f"- Seed code path: {op.seed_code_path}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _read_seed_code(seed_code_path: str) -> str:
+        code = Path(seed_code_path).read_text(encoding="utf-8", errors="replace")
+        max_chars = 60000
+        if len(code) > max_chars:
+            return code[:max_chars] + "\n/* ... seed code truncated for prompt length ... */"
+        return code
+
     # ════════════════════════════════════════
     # INIT
     # ════════════════════════════════════════
@@ -73,13 +99,32 @@ class AgentNodes:
         hints_text = self.kb.format_hints_for_prompt(kb_hints)
         kb_section = f"## 历史经验（仅供参考）\n{hints_text}" if kb_hints else ""
 
+        seed_code_section = ""
+        bootstrap_mode_instruction = "当前没有已有实现,请从零生成一个正确性优先的 v0 baseline。"
+        if op.seed_code_path:
+            seed_code = self._read_seed_code(op.seed_code_path)
+            seed_code_section = (
+                f"## 已有 v0 种子代码\n"
+                f"路径: {op.seed_code_path}\n"
+                f"```cuda\n{seed_code}\n```"
+            )
+            bootstrap_mode_instruction = (
+                "以下代码已经实现该算子,请将其作为 v0 baseline。"
+                "如果缺少正确性检查或 benchmark 框架,请补齐;不要修改算法逻辑,"
+                "只做必要的封装、命令行参数和输出格式适配。"
+            )
+
         prompt = self.llm.format_prompt(
             "bootstrap.md",
             operator_name=op.name,
             signature=op.signature,
-            dtypes=json.dumps(op.dtypes),
-            shapes=json.dumps(op.shapes),
+            dtypes=json.dumps(op.dtypes, ensure_ascii=False),
+            shapes=json.dumps(op.shapes, ensure_ascii=False),
+            shape_profiles=json.dumps(op.shape_profiles, ensure_ascii=False),
+            task_description=op.task_description or "无",
             constraints="\n".join(op.constraints) or "无",
+            bootstrap_mode_instruction=bootstrap_mode_instruction,
+            seed_code_section=seed_code_section,
             gpu_name=hw.gpu_name,
             compute_capability=hw.compute_capability,
             sm_count=hw.sm_count,
@@ -273,6 +318,7 @@ class AgentNodes:
         prompt = self.llm.format_prompt(
             "analyze.md",
             operator_name=op.name,
+            operator_context=self._operator_context(op),
             hardware_summary=self._hardware_summary(hw),
             best_id=run_state.current_best_id,
             best_code=state.get("current_code", "")[:8000],
@@ -317,6 +363,7 @@ class AgentNodes:
         prompt = self.llm.format_prompt(
             "decide_method.md",
             operator_name=op.name,
+            operator_context=self._operator_context(op),
             best_id=run_state.current_best_id,
             benchmark_metrics=bm_text,
             analysis_summary=json.dumps(analysis, ensure_ascii=False, indent=2),
@@ -362,6 +409,7 @@ class AgentNodes:
         prompt = self.llm.format_prompt(
             "propose_hp.md",
             operator_name=op.name,
+            operator_context=self._operator_context(op),
             method_name=decision.method_name,
             method_rationale=decision.rationale,
             hyperparams_schema=json.dumps(decision.hyperparams_schema or {}, indent=2),
@@ -392,6 +440,7 @@ class AgentNodes:
             apply_prompt = self.llm.format_prompt(
                 "apply_method.md",
                 operator_name=op.name,
+                operator_context=self._operator_context(op),
                 method_name=decision.method_name,
                 method_rationale=decision.rationale,
                 hyperparams_section=hp_section,
@@ -473,6 +522,7 @@ class AgentNodes:
         prompt = self.llm.format_prompt(
             "apply_method.md",
             operator_name=op.name,
+            operator_context=self._operator_context(op),
             method_name=decision.method_name,
             method_rationale=decision.rationale,
             hyperparams_section="(no hyperparams in this step)",

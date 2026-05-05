@@ -40,6 +40,7 @@ def load_config(env_path: str | Path | None = None) -> AgentConfig:
     return AgentConfig(
         llm_provider=llm_provider,
         llm_model=llm_model,
+        default_dtype=os.getenv("DEFAULT_DTYPE", "fp16"),
         max_iterations=int(os.getenv("MAX_ITERATIONS", "30")),
         consecutive_reject_limit=int(os.getenv("CONSECUTIVE_REJECT_LIMIT", "5")),
         accept_epsilon=float(os.getenv("ACCEPT_EPSILON", "0.005")),

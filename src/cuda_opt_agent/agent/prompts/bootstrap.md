@@ -5,7 +5,14 @@
 - 签名: {signature}
 - 数据类型: {dtypes}
 - 张量形状: {shapes}
+- 多尺度 Shape Profiles: {shape_profiles}
+- 任务说明: {task_description}
 - 约束: {constraints}
+
+## Bootstrap 模式
+{bootstrap_mode_instruction}
+
+{seed_code_section}
 
 ## 硬件信息
 - GPU: {gpu_name}

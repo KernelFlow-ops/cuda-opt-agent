@@ -32,6 +32,18 @@ class TestOperatorSpec:
         restored = OperatorSpec.model_validate_json(json_str)
         assert restored == sample_operator_spec
 
+    def test_shape_profiles_fill_shapes(self):
+        from cuda_opt_agent.models.data import OperatorSpec
+        spec = OperatorSpec(
+            name="softmax",
+            signature="y[B,N] = softmax(x[B,N], dim=-1)",
+            dtypes={"x": "fp16", "y": "fp16"},
+            shape_profiles=[{"x": [1024, 1024], "y": [1024, 1024]}],
+            task_description="Use max-trick for numerical stability.",
+        )
+        assert spec.shapes == {"x": [1024, 1024], "y": [1024, 1024]}
+        assert spec.seed_code_path is None
+
 
 class TestHardwareSpec:
     def test_create(self, sample_hardware_spec):

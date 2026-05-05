@@ -134,20 +134,37 @@ class PersistenceManager:
         return config_path
 
     def update_best_symlink(self, run_dir: Path, iter_dir: Path) -> None:
-        """更新 best/ 软链接指向最新 best。"""
+        """更新 best 指针。
+
+        best.txt 是跨平台主机制。Windows 默认不创建目录 symlink,避免普通
+        用户权限下触发 WinError 1314;如确实需要 symlink,设置
+        ENABLE_BEST_SYMLINK=1。
+        """
         if not iter_dir.exists():
             raise FileNotFoundError(f"best target directory not found: {iter_dir}")
         best_dir = run_dir / "best"
         best_target = iter_dir.relative_to(run_dir)
         (run_dir / "best.txt").write_text(str(best_target), encoding="utf-8")
-        if best_dir.is_symlink() or best_dir.exists():
+
+        enable_symlink = os.getenv("ENABLE_BEST_SYMLINK", "").lower() in {"1", "true", "yes", "on"}
+        if os.name == "nt" and not enable_symlink:
             if best_dir.is_symlink():
                 best_dir.unlink()
-            # 如果是实际目录则不动 (不应发生)
+            return
+
+        if best_dir.is_symlink():
+            best_dir.unlink()
+        elif best_dir.exists():
+            logger.info("best path exists and is not a symlink; best.txt was written: %s", best_dir)
+            return
+
         try:
-            best_dir.symlink_to(best_target)
-        except Exception as e:
-            logger.info("Could not create best symlink; best.txt was written: %s", e)
+            best_dir.symlink_to(best_target, target_is_directory=True)
+        except OSError as e:
+            if os.name == "nt" and getattr(e, "winerror", None) == 1314:
+                logger.debug("Windows lacks permission to create best symlink; best.txt was written")
+            else:
+                logger.info("Could not create best symlink; best.txt was written: %s", e)
 
     def save_reasoning_log(self, text: str, run_dir: Path) -> None:
         """向全局 reasoning_log.md 追加。"""

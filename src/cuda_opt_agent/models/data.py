@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # ────────────────────────────────────────────
@@ -45,6 +45,19 @@ class OperatorSpec(BaseModel):
     dtypes: dict[str, str] = Field(default_factory=dict, description="各张量数据类型")
     shapes: dict[str, list[int]] = Field(default_factory=dict, description="各张量形状")
     constraints: list[str] = Field(default_factory=list, description="用户自由文本约束")
+    task_description: str = Field(default="", description="自由文本任务说明")
+    seed_code_path: str | None = Field(default=None, description="已有 .cu 文件路径,作为 v0 起点")
+    shape_profiles: list[dict[str, list[int]]] = Field(
+        default_factory=list,
+        description="多尺度 shape profiles; shapes 为空时默认使用第一个 profile",
+    )
+
+    @model_validator(mode="after")
+    def fill_shapes_from_first_profile(self) -> "OperatorSpec":
+        """Keep legacy single-shape flows working for multi-profile specs."""
+        if not self.shapes and self.shape_profiles:
+            self.shapes = dict(self.shape_profiles[0])
+        return self
 
 
 class HardwareSpec(BaseModel):
@@ -152,6 +165,7 @@ class AgentConfig(BaseModel):
     """Agent 运行时配置。"""
     llm_provider: str = "anthropic"
     llm_model: str = "claude-sonnet-4-20250514"
+    default_dtype: str = "fp16"
     max_iterations: int = 30
     consecutive_reject_limit: int = 5
     accept_epsilon: float = 0.005

@@ -1,5 +1,8 @@
 你正在优化一个 CUDA {operator_name} 算子。当前最佳版本 {best_id} 的 ncu 报告显示:
 
+## 任务上下文
+{operator_context}
+
 ## 性能指标
 {benchmark_metrics}
 

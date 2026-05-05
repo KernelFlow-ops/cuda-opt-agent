@@ -1,5 +1,8 @@
 你正在优化一个 CUDA {operator_name} 算子。请分析当前最佳版本的性能瓶颈。
 
+## 任务上下文
+{operator_context}
+
 ## 硬件信息
 {hardware_summary}
 

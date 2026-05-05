@@ -1,5 +1,8 @@
 你正在优化一个 CUDA {operator_name} 算子。已决定使用方法: **{method_name}**。
 
+## 任务上下文
+{operator_context}
+
 ## 方法描述
 {method_rationale}
 

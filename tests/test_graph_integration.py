@@ -150,6 +150,37 @@ int main() { return 0; }
         assert "__global__" in result["current_code"]
         assert result["new_version_id"] == "v0"
 
+    def test_bootstrap_node_includes_seed_code(self, sample_agent_config,
+                                               sample_operator_spec,
+                                               sample_hardware_spec,
+                                               tmp_dir):
+        nodes, sm, llm = self._make_nodes(sample_agent_config)
+        seed = tmp_dir / "seed.cu"
+        seed.write_text("__global__ void seeded_kernel() {}\n", encoding="utf-8")
+        op_spec = sample_operator_spec.model_copy(update={
+            "seed_code_path": str(seed),
+            "task_description": "Keep the algorithm unchanged.",
+        })
+
+        llm.format_prompt.return_value = "test prompt"
+        llm.invoke.return_value = '''```cuda
+#include <cuda_runtime.h>
+__global__ void kernel() {}
+int main() { return 0; }
+```'''
+
+        state: GraphState = {
+            "operator_spec": op_spec,
+            "hardware_spec": sample_hardware_spec,
+        }
+        result = nodes.bootstrap_node(state)
+
+        _, kwargs = llm.format_prompt.call_args
+        assert "seeded_kernel" in kwargs["seed_code_section"]
+        assert "v0 baseline" in kwargs["bootstrap_mode_instruction"]
+        assert kwargs["task_description"] == "Keep the algorithm unchanged."
+        assert result["new_version_id"] == "v0"
+
     def test_analyze_node(self, sample_agent_config, sample_operator_spec,
                           sample_hardware_spec, sample_run_state,
                           sample_ncu_metrics, sample_benchmark_result):

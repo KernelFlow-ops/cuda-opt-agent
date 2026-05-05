@@ -102,6 +102,25 @@ class TestPersistenceManager:
 
         assert not (run_dir / "best.txt").exists()
 
+    def test_update_best_writes_best_txt_without_windows_symlink(self, tmp_dir, monkeypatch, caplog):
+        import logging
+        import cuda_opt_agent.memory.persistence as persistence_module
+        from cuda_opt_agent.memory.persistence import PersistenceManager
+
+        monkeypatch.setattr(persistence_module.os, "name", "nt")
+        monkeypatch.delenv("ENABLE_BEST_SYMLINK", raising=False)
+
+        pm = PersistenceManager(str(tmp_dir / "runs"))
+        run_dir = pm.create_run_dir("test")
+        iter_dir = pm.create_iteration_dir(run_dir, "v0")
+
+        with caplog.at_level(logging.INFO):
+            pm.update_best_symlink(run_dir, iter_dir)
+
+        assert (run_dir / "best.txt").read_text(encoding="utf-8") == "iterv0"
+        assert not (run_dir / "best").exists()
+        assert "Could not create best symlink" not in caplog.text
+
     def test_find_latest_unfinished(self, tmp_dir, sample_run_state):
         from cuda_opt_agent.memory.persistence import PersistenceManager
         pm = PersistenceManager(str(tmp_dir / "runs"))
