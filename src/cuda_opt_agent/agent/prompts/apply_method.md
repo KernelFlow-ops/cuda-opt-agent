@@ -29,5 +29,6 @@
 7. 校验 JSON 必须包含字段: `correct`, `max_abs_error`, `max_rel_error`, `message`
 8. Benchmark JSON 必须包含字段: `latency_ms_median`, `latency_ms_p95`, `throughput_gflops`; 或输出 `latencies_ms` 数组
 9. `--check` 必须在用户请求的完整 shape 上运行 kernel,然后抽样输出元素并只为这些元素计算 CPU reference；不要只用 reduced/small shape 判断正确性
+10. 保持并支持 `--shape key=value [key=value ...]` 参数,不要重新硬编码单一尺寸；例如 `--shape M=4096 N=4096 K=4096` 或 `--shape B=4096 N=4096`
 
 请直接输出完整的 .cu 代码,用 ```cuda 包裹。

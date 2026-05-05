@@ -48,6 +48,7 @@ def load_config(env_path: str | Path | None = None) -> AgentConfig:
         hp_candidate_count=int(os.getenv("HP_CANDIDATE_COUNT", "5")),
         benchmark_warmup_rounds=int(os.getenv("BENCHMARK_WARMUP_ROUNDS", "10")),
         benchmark_measure_rounds=int(os.getenv("BENCHMARK_MEASURE_ROUNDS", "100")),
+        multi_shape_aggregator=os.getenv("MULTI_SHAPE_AGGREGATOR", "mean"),
         runs_dir=os.getenv("RUNS_DIR", "runs"),
         knowledge_base_dir=os.getenv("KNOWLEDGE_BASE_DIR", "knowledge_base"),
     )

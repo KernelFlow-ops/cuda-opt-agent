@@ -22,9 +22,10 @@ from ..models.data import (
     NcuMetrics,
 )
 from ..models.enums import normalize_method_name
-from ..tools.benchmark import run_benchmark
+from ..shape_profiles import shape_profile_to_args
+from ..tools.benchmark import run_benchmark_multi
 from ..tools.compile import compile_cuda
-from ..tools.correctness import check_correctness
+from ..tools.correctness import check_correctness_multi, summarize_correctness_results
 from ..tools.hardware import collect_hardware_info
 from ..tools.profile import format_ncu_for_prompt, run_ncu_profile
 from .llm_client import LLMClient
@@ -74,6 +75,41 @@ class AgentNodes:
         if len(code) > max_chars:
             return code[:max_chars] + "\n/* ... seed code truncated for prompt length ... */"
         return code
+
+    @staticmethod
+    def _active_shape_profiles(op) -> list[dict]:
+        if op.shape_profiles:
+            return op.shape_profiles
+        if op.shapes:
+            return [op.shapes]
+        return [{}]
+
+    def _benchmark_multi(self, exe_path: Path, op) -> BenchmarkResult:
+        return run_benchmark_multi(
+            exe_path,
+            self._active_shape_profiles(op),
+            warmup_rounds=self.sm.config.benchmark_warmup_rounds,
+            measure_rounds=self.sm.config.benchmark_measure_rounds,
+            aggregator=self.sm.config.multi_shape_aggregator,
+        )
+
+    @staticmethod
+    def _profile_args_from_benchmark(bm: BenchmarkResult) -> list[str]:
+        shape = bm.extra.get("worst_shape") if bm and bm.extra else None
+        args = shape_profile_to_args(shape or {})
+        args.extend(["--warmup", "0", "--rounds", "1"])
+        return args
+
+    @staticmethod
+    def _per_shape_summary(bm: BenchmarkResult | None, limit: int = 3) -> str:
+        if not bm or not bm.extra.get("per_shape"):
+            return ""
+        parts = []
+        for item in bm.extra["per_shape"][:limit]:
+            parts.append(f"{item.get('shape_label', 'shape')}={item.get('latency_ms_median', 0.0):.4f}ms")
+        if len(bm.extra["per_shape"]) > limit:
+            parts.append(f"+{len(bm.extra['per_shape']) - limit} more")
+        return "<br>".join(parts)
 
     # ════════════════════════════════════════
     # INIT
@@ -174,17 +210,19 @@ class AgentNodes:
 
                 # 数值校验
                 dtype = list(op.dtypes.values())[0] if op.dtypes else "fp32"
-                check = check_correctness(
+                correctness_results = check_correctness_multi(
                     exe_path,
+                    self._active_shape_profiles(op),
                     dtype=dtype,
                 )
-                if check.correct:
+                if all(r.get("correct") for r in correctness_results):
                     correctness_ok = True
                     break
                 else:
-                    logger.warning("Correctness failed (attempt %d): %s", attempt, check.message)
+                    message = summarize_correctness_results(correctness_results)
+                    logger.warning("Correctness failed (attempt %d): %s", attempt, message)
                     if attempt < max_retries:
-                        code = self._repair_code(code, f"Correctness failed: {check.message}", hw)
+                        code = self._repair_code(code, f"Correctness failed: {message}", hw)
                         code_path = self.sm.persistence.save_code(code, iter_dir, f"code_fix{attempt+1}.cu")
             else:
                 compile_output = (cr.stdout + "\n" + cr.stderr).strip()
@@ -251,16 +289,13 @@ class AgentNodes:
             raise FileNotFoundError(f"Best executable not found: {exe_path}")
 
         # Benchmark
-        bm = run_benchmark(
-            exe_path,
-            warmup_rounds=self.sm.config.benchmark_warmup_rounds,
-            measure_rounds=self.sm.config.benchmark_measure_rounds,
-        )
+        bm = self._benchmark_multi(exe_path, run_state.operator_spec)
 
         # ncu Profile
         ncu = run_ncu_profile(
             exe_path,
             output_report_path=best_dir / "ncu_report.txt",
+            executable_args=self._profile_args_from_benchmark(bm),
         )
 
         # 读取 best 代码
@@ -312,7 +347,9 @@ class AgentNodes:
         bm_text = (
             f"latency_median: {bm.latency_ms_median:.4f} ms\n"
             f"latency_p95: {bm.latency_ms_p95:.4f} ms\n"
-            f"throughput: {bm.throughput_gflops or 'N/A'} GFLOPS"
+            f"throughput: {bm.throughput_gflops or 'N/A'} GFLOPS\n"
+            f"aggregator: {bm.extra.get('aggregator', 'single')}\n"
+            f"per_shape: {self._per_shape_summary(bm).replace('<br>', '; ') or 'N/A'}"
         )
 
         prompt = self.llm.format_prompt(
@@ -357,7 +394,9 @@ class AgentNodes:
 
         bm_text = (
             f"latency_median: {bm.latency_ms_median:.4f} ms\n"
-            f"latency_p95: {bm.latency_ms_p95:.4f} ms"
+            f"latency_p95: {bm.latency_ms_p95:.4f} ms\n"
+            f"aggregator: {bm.extra.get('aggregator', 'single')}\n"
+            f"per_shape: {self._per_shape_summary(bm).replace('<br>', '; ') or 'N/A'}"
         )
 
         prompt = self.llm.format_prompt(
@@ -463,17 +502,13 @@ class AgentNodes:
 
             # 校验
             dtype = list(op.dtypes.values())[0] if op.dtypes else "fp32"
-            check = check_correctness(exe_path, dtype=dtype)
-            if not check.correct:
-                logger.warning("Candidate %d correctness check failed", cand.index)
+            correctness_results = check_correctness_multi(exe_path, self._active_shape_profiles(op), dtype=dtype)
+            if not all(r.get("correct") for r in correctness_results):
+                logger.warning("Candidate %d correctness check failed: %s", cand.index, summarize_correctness_results(correctness_results))
                 continue
 
             # 测速
-            bm = run_benchmark(
-                exe_path,
-                warmup_rounds=self.sm.config.benchmark_warmup_rounds,
-                measure_rounds=self.sm.config.benchmark_measure_rounds,
-            )
+            bm = self._benchmark_multi(exe_path, op)
             results.append({
                 "index": cand.index,
                 "version_id": version_id,
@@ -584,11 +619,7 @@ class AgentNodes:
 
             iter_dir = self.sm.run_dir / f"iter{version_id}"
             exe_path = self._kernel_executable(iter_dir)
-            trial_bm = run_benchmark(
-                exe_path,
-                warmup_rounds=self.sm.config.benchmark_warmup_rounds,
-                measure_rounds=self.sm.config.benchmark_measure_rounds,
-            )
+            trial_bm = self._benchmark_multi(exe_path, run_state.operator_spec)
 
         best_bm = state.get("current_benchmark", BenchmarkResult())
 
@@ -794,11 +825,12 @@ class AgentNodes:
         lines.append("")
         lines.append("## 各迭代详情")
         lines.append("")
-        lines.append("| 版本 | 方法 | latency (ms) | 状态 |")
-        lines.append("|------|------|-------------|------|")
+        lines.append("| 版本 | 方法 | aggregate latency (ms) | per-shape latency | 状态 |")
+        lines.append("|------|------|------------------------|-------------------|------|")
         for it in run_state.iterations:
             lat = f"{it.benchmark.latency_ms_median:.4f}" if it.benchmark else "N/A"
+            per_shape = self._per_shape_summary(it.benchmark) or "-"
             status = "✓" if it.accepted else "✗"
-            lines.append(f"| {it.version_id} | {it.method_name or 'baseline'} | {lat} | {status} |")
+            lines.append(f"| {it.version_id} | {it.method_name or 'baseline'} | {lat} | {per_shape} | {status} |")
 
         return "\n".join(lines)

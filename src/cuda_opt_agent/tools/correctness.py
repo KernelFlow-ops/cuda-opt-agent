@@ -9,6 +9,9 @@ import logging
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+
+from ..shape_profiles import ShapeProfile, shape_profile_label, shape_profile_to_args
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +122,52 @@ def check_correctness(
             rtol_used=used_rtol,
             message=f"Correctness check error: {e}",
         )
+
+
+def check_correctness_multi(
+    executable_path: str | Path,
+    shape_profiles: list[ShapeProfile] | None,
+    dtype: str = "fp32",
+    atol: float | None = None,
+    rtol: float | None = None,
+    timeout: int = 120,
+    extra_args: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Run correctness once per shape profile."""
+    profiles = shape_profiles or [{}]
+    results = []
+    for profile in profiles:
+        args = []
+        args.extend(shape_profile_to_args(profile))
+        if extra_args:
+            args.extend(extra_args)
+        result = check_correctness(
+            executable_path,
+            dtype=dtype,
+            atol=atol,
+            rtol=rtol,
+            timeout=timeout,
+            extra_args=args,
+        )
+        results.append({
+            "shape": profile,
+            "shape_label": shape_profile_label(profile),
+            "correct": result.correct,
+            "max_abs_error": result.max_abs_error,
+            "max_rel_error": result.max_rel_error,
+            "atol_used": result.atol_used,
+            "rtol_used": result.rtol_used,
+            "message": result.message,
+            "details": result.details,
+        })
+    return results
+
+
+def summarize_correctness_results(results: list[dict[str, Any]]) -> str:
+    failed = [r for r in results if not r.get("correct")]
+    if not failed:
+        return "all shape profiles passed"
+    return "; ".join(f"{r.get('shape_label')}: {r.get('message')}" for r in failed)
 
 
 def _parse_correctness_output(

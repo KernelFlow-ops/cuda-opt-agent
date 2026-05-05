@@ -43,11 +43,11 @@ class OperatorSpec(BaseModel):
     name: str = Field(..., description="算子名称, 如 gemm, softmax, conv2d")
     signature: str = Field(..., description="算子签名, 如 C = A @ B, A:[M,K] B:[K,N]")
     dtypes: dict[str, str] = Field(default_factory=dict, description="各张量数据类型")
-    shapes: dict[str, list[int]] = Field(default_factory=dict, description="各张量形状")
+    shapes: dict[str, Any] = Field(default_factory=dict, description="各张量形状或维度参数")
     constraints: list[str] = Field(default_factory=list, description="用户自由文本约束")
     task_description: str = Field(default="", description="自由文本任务说明")
     seed_code_path: str | None = Field(default=None, description="已有 .cu 文件路径,作为 v0 起点")
-    shape_profiles: list[dict[str, list[int]]] = Field(
+    shape_profiles: list[dict[str, Any]] = Field(
         default_factory=list,
         description="多尺度 shape profiles; shapes 为空时默认使用第一个 profile",
     )
@@ -173,6 +173,7 @@ class AgentConfig(BaseModel):
     hp_candidate_count: int = 5
     benchmark_warmup_rounds: int = 10
     benchmark_measure_rounds: int = 100
+    multi_shape_aggregator: Literal["mean", "worst", "weighted"] = "mean"
     runs_dir: str = "runs"
     knowledge_base_dir: str = "knowledge_base"
 

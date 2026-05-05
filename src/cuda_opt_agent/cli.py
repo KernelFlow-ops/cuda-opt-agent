@@ -25,6 +25,7 @@ from rich.console import Console
 
 from .config import load_config
 from .models.data import AgentConfig, OperatorSpec
+from .shape_profiles import default_shape_profiles, dims_to_profile, parse_shape_profiles
 from .task_spec import load_operator_spec, resolve_existing_cuda_path
 
 
@@ -108,6 +109,7 @@ def _apply_config_overrides(
     consecutive_reject_limit: int | None = None,
     accept_epsilon: float | None = None,
     hp_candidate_count: int | None = None,
+    multi_shape_aggregator: str | None = None,
 ) -> None:
     if dtype is not None:
         config.default_dtype = dtype
@@ -119,6 +121,8 @@ def _apply_config_overrides(
         config.accept_epsilon = accept_epsilon
     if hp_candidate_count is not None:
         config.hp_candidate_count = hp_candidate_count
+    if multi_shape_aggregator is not None:
+        config.multi_shape_aggregator = multi_shape_aggregator
 
 
 def _parse_shape(shape: str | None) -> list[int]:
@@ -141,28 +145,61 @@ def _apply_dtype_to_spec(spec: OperatorSpec, dtype: str) -> None:
         spec.dtypes = _generic_dtypes(dtype)
 
 
+def _profiles_from_cli(
+    operator: str,
+    *,
+    shape_list: list[int],
+    shapes: str | None,
+    shape_profile: str | None,
+) -> list[dict]:
+    if shapes and shape_profile:
+        raise ValueError("Use only one of --shapes or --shape-profile")
+    if shapes:
+        return parse_shape_profiles(operator, shapes)
+    if shape_profile:
+        return default_shape_profiles(operator, shape_profile)
+    if shape_list:
+        return [dims_to_profile(operator, shape_list)]
+    return []
+
+
+def _gemm_shapes_from_profile(profile: dict) -> dict[str, list[int]] | None:
+    try:
+        m = int(profile["M"])
+        n = int(profile["N"])
+        k = int(profile["K"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return {"A": [m, k], "B": [k, n], "C": [m, n]}
+
+
 def _operator_spec_from_fields(
     *,
     operator: str,
     signature: str | None,
     shape: str | None,
     dtype: str,
+    shapes: str | None = None,
+    shape_profile: str | None = None,
     task_description: str = "",
     seed_code_path: str | None = None,
 ) -> OperatorSpec:
     shape_list = _parse_shape(shape)
-    if operator.lower() == "gemm" and len(shape_list) == 3:
-        m, n, k = shape_list
-        shapes = {"A": [m, k], "B": [k, n], "C": [m, n]}
+    profiles = _profiles_from_cli(operator, shape_list=shape_list, shapes=shapes, shape_profile=shape_profile)
+    gemm_shapes = _gemm_shapes_from_profile(profiles[0]) if profiles else None
+    if operator.lower() == "gemm" and gemm_shapes:
+        m = gemm_shapes["A"][0]
+        n = gemm_shapes["C"][1]
+        k = gemm_shapes["A"][1]
         return OperatorSpec(
             name=operator,
             signature=signature or f"C[M,N] = A[M,K] @ B[K,N], M={m}, N={n}, K={k}",
             dtypes={"A": dtype, "B": dtype, "C": dtype},
-            shapes=shapes,
+            shapes=gemm_shapes,
             constraints=list(GEMM_FULL_SHAPE_CONSTRAINTS),
             task_description=task_description,
             seed_code_path=seed_code_path,
-            shape_profiles=[shapes],
+            shape_profiles=profiles,
         )
 
     shapes = {"input": shape_list} if shape_list else {}
@@ -173,7 +210,7 @@ def _operator_spec_from_fields(
         shapes=shapes,
         task_description=task_description,
         seed_code_path=seed_code_path,
-        shape_profiles=[shapes] if shapes else [],
+        shape_profiles=profiles,
     )
 
 
@@ -183,6 +220,8 @@ def _build_task_spec(
     task: str,
     signature: str | None,
     shape: str | None,
+    shapes: str | None,
+    shape_profile: str | None,
     config: AgentConfig,
 ) -> OperatorSpec:
     if not operator:
@@ -191,6 +230,8 @@ def _build_task_spec(
         operator=operator,
         signature=signature,
         shape=shape,
+        shapes=shapes,
+        shape_profile=shape_profile,
         dtype=config.default_dtype,
         task_description=task,
     )
@@ -203,6 +244,8 @@ def _build_seed_spec(
     task: str | None,
     signature: str | None,
     shape: str | None,
+    shapes: str | None,
+    shape_profile: str | None,
     config: AgentConfig,
 ) -> OperatorSpec:
     seed_code_path = resolve_existing_cuda_path(file_cu)
@@ -211,6 +254,8 @@ def _build_seed_spec(
         operator=op_name,
         signature=signature,
         shape=shape,
+        shapes=shapes,
+        shape_profile=shape_profile,
         dtype=config.default_dtype,
         task_description=task or f"Optimize existing CUDA implementation from {Path(seed_code_path).name}.",
         seed_code_path=seed_code_path,
@@ -288,6 +333,7 @@ def _load_config_with_overrides(
     consecutive_reject_limit: int | None,
     accept_epsilon: float | None,
     hp_candidate_count: int | None,
+    multi_shape_aggregator: str | None,
 ) -> AgentConfig:
     config = load_config(env_file)
     _configure_console_encoding()
@@ -298,6 +344,7 @@ def _load_config_with_overrides(
         consecutive_reject_limit=consecutive_reject_limit,
         accept_epsilon=accept_epsilon,
         hp_candidate_count=hp_candidate_count,
+        multi_shape_aggregator=multi_shape_aggregator,
     )
     return config
 
@@ -310,6 +357,8 @@ def new(
     from_cu: Optional[str] = typer.Option(None, "--from-cu", help="Existing .cu file to use as v0 seed"),
     signature: Optional[str] = typer.Option(None, "--sig", help="Operator signature, e.g. 'C = A @ B'"),
     shape: Optional[str] = typer.Option(None, "--shape", help="Comma-separated shape"),
+    shapes: Optional[str] = typer.Option(None, "--shapes", help="Semicolon-separated shape profiles, e.g. '1024^3;2048^3'"),
+    shape_profile: Optional[str] = typer.Option(None, "--shape-profile", help="Default profile: small, medium, large, sweep"),
     dtype: Optional[str] = typer.Option(
         None, "--dtype", help="Data type (defaults to DEFAULT_DTYPE in .env, fallback fp16)"
     ),
@@ -331,6 +380,11 @@ def new(
         "--hp-candidate-count",
         help="Hyperparameter candidates per search (defaults to HP_CANDIDATE_COUNT in .env)",
     ),
+    multi_shape_aggregator: Optional[str] = typer.Option(
+        None,
+        "--multi-shape-aggregator",
+        help="Aggregate multi-shape latency with mean, worst, or weighted",
+    ),
     env_file: Optional[str] = typer.Option(None, "--env", help="Path to .env file"),
     log_level: str = typer.Option("INFO", "--log-level", help="Logging level"),
     log_file: Optional[str] = typer.Option(None, "--log-file", help="UTF-8 log file path"),
@@ -345,6 +399,7 @@ def new(
         consecutive_reject_limit=consecutive_reject_limit,
         accept_epsilon=accept_epsilon,
         hp_candidate_count=hp_candidate_count,
+        multi_shape_aggregator=multi_shape_aggregator,
     )
 
     modes = [spec_file is not None, task is not None, from_cu is not None]
@@ -356,7 +411,15 @@ def new(
         if spec_file:
             op_spec = _load_spec_mode(spec_file, operator, dtype, config)
         elif task:
-            op_spec = _build_task_spec(operator, task=task, signature=signature, shape=shape, config=config)
+            op_spec = _build_task_spec(
+                operator,
+                task=task,
+                signature=signature,
+                shape=shape,
+                shapes=shapes,
+                shape_profile=shape_profile,
+                config=config,
+            )
         elif from_cu:
             op_spec = _build_seed_spec(
                 from_cu,
@@ -364,6 +427,8 @@ def new(
                 task=None,
                 signature=signature,
                 shape=shape,
+                shapes=shapes,
+                shape_profile=shape_profile,
                 config=config,
             )
         elif auto:
@@ -385,6 +450,8 @@ def tune(
     task: Optional[str] = typer.Option(None, "--task", help="Additional natural language task context"),
     signature: Optional[str] = typer.Option(None, "--sig", help="Operator signature"),
     shape: Optional[str] = typer.Option(None, "--shape", help="Comma-separated shape"),
+    shapes: Optional[str] = typer.Option(None, "--shapes", help="Semicolon-separated shape profiles, e.g. '1024^3;2048^3'"),
+    shape_profile: Optional[str] = typer.Option(None, "--shape-profile", help="Default profile: small, medium, large, sweep"),
     dtype: Optional[str] = typer.Option(
         None, "--dtype", help="Data type (defaults to DEFAULT_DTYPE in .env, fallback fp16)"
     ),
@@ -405,6 +472,11 @@ def tune(
         None,
         "--hp-candidate-count",
         help="Hyperparameter candidates per search (defaults to HP_CANDIDATE_COUNT in .env)",
+    ),
+    multi_shape_aggregator: Optional[str] = typer.Option(
+        None,
+        "--multi-shape-aggregator",
+        help="Aggregate multi-shape latency with mean, worst, or weighted",
     ),
     env_file: Optional[str] = typer.Option(None, "--env", help="Path to .env file"),
     log_level: str = typer.Option("INFO", "--log-level", help="Logging level"),
@@ -419,6 +491,7 @@ def tune(
         consecutive_reject_limit=consecutive_reject_limit,
         accept_epsilon=accept_epsilon,
         hp_candidate_count=hp_candidate_count,
+        multi_shape_aggregator=multi_shape_aggregator,
     )
     try:
         op_spec = _build_seed_spec(
@@ -427,6 +500,8 @@ def tune(
             task=task,
             signature=signature,
             shape=shape,
+            shapes=shapes,
+            shape_profile=shape_profile,
             config=config,
         )
     except (FileNotFoundError, RuntimeError, ValueError, typer.BadParameter) as e:
@@ -441,6 +516,8 @@ def run(
     operator: str = typer.Argument(..., help="Operator name, e.g. gemm, softmax, conv2d"),
     signature: str = typer.Option("", "--sig", help="Operator signature, e.g. 'C = A @ B'"),
     shape: str = typer.Option("4096,4096,4096", "--shape", help="Comma-separated shape"),
+    shapes: Optional[str] = typer.Option(None, "--shapes", help="Semicolon-separated shape profiles, e.g. '1024^3;2048^3'"),
+    shape_profile: Optional[str] = typer.Option(None, "--shape-profile", help="Default profile: small, medium, large, sweep"),
     dtype: Optional[str] = typer.Option(
         None, "--dtype", help="Data type (defaults to DEFAULT_DTYPE in .env, fallback fp16)"
     ),
@@ -461,6 +538,11 @@ def run(
         None,
         "--hp-candidate-count",
         help="Hyperparameter candidates per search (defaults to HP_CANDIDATE_COUNT in .env)",
+    ),
+    multi_shape_aggregator: Optional[str] = typer.Option(
+        None,
+        "--multi-shape-aggregator",
+        help="Aggregate multi-shape latency with mean, worst, or weighted",
     ),
     env_file: Optional[str] = typer.Option(None, "--env", help="Path to .env file"),
     log_level: str = typer.Option("INFO", "--log-level", help="Logging level"),
@@ -476,11 +558,14 @@ def run(
         consecutive_reject_limit=consecutive_reject_limit,
         accept_epsilon=accept_epsilon,
         hp_candidate_count=hp_candidate_count,
+        multi_shape_aggregator=multi_shape_aggregator,
     )
     op_spec = _operator_spec_from_fields(
         operator=operator,
         signature=signature,
         shape=shape,
+        shapes=shapes,
+        shape_profile=shape_profile,
         dtype=config.default_dtype,
     )
     _run_task(op_spec, config=config)

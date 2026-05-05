@@ -14,6 +14,22 @@ from rich.text import Text
 from ..models.data import IterationRecord, RunState
 
 
+def _per_shape_summary(iteration: IterationRecord, limit: int = 2) -> str:
+    if not iteration.benchmark:
+        return ""
+    per_shape = iteration.benchmark.extra.get("per_shape", [])
+    if not per_shape:
+        return ""
+    parts = []
+    for item in per_shape[:limit]:
+        label = item.get("shape_label", "shape")
+        latency = item.get("latency_ms_median", 0.0)
+        parts.append(f"{label}:{latency:.3f}")
+    if len(per_shape) > limit:
+        parts.append(f"+{len(per_shape) - limit}")
+    return " ".join(parts)
+
+
 def build_dashboard_panel(state: RunState) -> Panel:
     """构建主控面板。"""
     op = state.operator_spec
@@ -32,7 +48,9 @@ def build_dashboard_panel(state: RunState) -> Panel:
 
     if v0 and v0.benchmark:
         info_lines.append(f"")
-        info_lines.append(f"Baseline (v0)         {v0.benchmark.latency_ms_median:.3f} ms")
+        shape_count = v0.benchmark.extra.get("shape_count") if v0.benchmark.extra else None
+        suffix = f" across {shape_count} shapes" if shape_count else ""
+        info_lines.append(f"Baseline (v0)         {v0.benchmark.latency_ms_median:.3f} ms{suffix}")
 
     if best and best.benchmark and best.version_id != "v0":
         speedup = v0.benchmark.latency_ms_median / best.benchmark.latency_ms_median if v0 and v0.benchmark else 0
@@ -62,6 +80,7 @@ def build_history_table(state: RunState) -> Table:
     table.add_column("Method", style="green", width=30, overflow="fold")
     table.add_column("Hyperparams", width=20, overflow="fold")
     table.add_column("Latency (ms)", justify="right", width=14, overflow="fold")
+    table.add_column("Per-shape", width=28, overflow="fold")
     table.add_column("Speedup", justify="right", width=10, overflow="fold")
     table.add_column("Status", width=10, overflow="fold")
 
@@ -88,6 +107,7 @@ def build_history_table(state: RunState) -> Table:
             it.method_name or "baseline",
             hp_str,
             lat_str,
+            _per_shape_summary(it),
             speedup_str,
             status,
         )

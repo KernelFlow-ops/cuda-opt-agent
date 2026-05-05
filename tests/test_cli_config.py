@@ -13,6 +13,7 @@ CONFIG_ENV_KEYS = [
     "CONSECUTIVE_REJECT_LIMIT",
     "ACCEPT_EPSILON",
     "HP_CANDIDATE_COUNT",
+    "MULTI_SHAPE_AGGREGATOR",
 ]
 
 
@@ -179,6 +180,54 @@ def test_run_cli_options_override_env_defaults(tmp_dir, monkeypatch):
     assert config.hp_candidate_count == 4
     assert set(op_spec.dtypes.values()) == {"fp32"}
     assert "Max iterations: 7" in result.output
+
+
+def test_run_shapes_parses_multi_gemm_profiles(tmp_dir, monkeypatch):
+    clear_config_env(monkeypatch)
+
+    captured, _ = invoke_cli(
+        monkeypatch,
+        [
+            "run",
+            "gemm",
+            "--shapes",
+            "1024^3;2048^3",
+            "--multi-shape-aggregator",
+            "worst",
+            "--env",
+            str(tmp_dir / "missing.env"),
+        ],
+    )
+
+    config = captured["config"]
+    op_spec = captured["operator_spec"]
+    assert config.multi_shape_aggregator == "worst"
+    assert op_spec.shape_profiles == [
+        {"M": 1024, "N": 1024, "K": 1024},
+        {"M": 2048, "N": 2048, "K": 2048},
+    ]
+    assert op_spec.shapes == {"A": [1024, 1024], "B": [1024, 1024], "C": [1024, 1024]}
+
+
+def test_new_shape_profile_uses_operator_defaults(tmp_dir, monkeypatch):
+    clear_config_env(monkeypatch)
+
+    captured, _ = invoke_cli(
+        monkeypatch,
+        [
+            "new",
+            "softmax",
+            "--task",
+            "stable softmax",
+            "--shape-profile",
+            "sweep",
+            "--env",
+            str(tmp_dir / "missing.env"),
+        ],
+    )
+
+    op_spec = captured["operator_spec"]
+    assert op_spec.shape_profiles == [{"B": 1024, "N": 1024}, {"B": 4096, "N": 4096}]
 
 
 def test_new_spec_mode_builds_operator_spec(tmp_dir, monkeypatch):

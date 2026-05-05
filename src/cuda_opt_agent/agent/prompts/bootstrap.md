@@ -36,11 +36,12 @@
      b) 调用 kernel
      c) 与 reference 比较(输出 JSON 格式的校验结果)
      d) cudaEvent 计时(输出 JSON 格式的 benchmark 结果)
-   - 支持命令行参数: --check (只做校验) / --warmup N / --rounds N / --atol F / --rtol F
+   - 支持命令行参数: --check (只做校验) / --shape key=value [key=value ...] / --warmup N / --rounds N / --atol F / --rtol F
 3. 使用简单直接的实现,避免不必要的复杂优化
 4. 对边界条件做正确处理
 5. `--check` 必须快速完成且有代表性: kernel 必须在用户请求的完整 shape 上运行,然后抽样若干输出元素并只为这些元素计算 CPU reference；不要把 reduced/small shape 作为唯一正确性依据。
 6. 校验 JSON 必须包含字段: `correct`, `max_abs_error`, `max_rel_error`, `message`。
 7. Benchmark JSON 必须包含字段: `latency_ms_median`, `latency_ms_p95`, `throughput_gflops`; 或输出 `latencies_ms` 数组。
+8. 不要硬编码单一尺寸；必须解析 `--shape` 后面的键值对,例如 `--shape M=4096 N=4096 K=4096` 或 `--shape B=4096 N=4096`。如果值是多维张量形状,例如 `x=1024,1024`,需要按逗号解析。
 
 请直接输出完整的 .cu 代码,用 ```cuda 包裹。之后附一段简短自述(50字以内)说明你的实现思路。

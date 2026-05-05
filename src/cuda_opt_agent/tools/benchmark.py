@@ -11,8 +11,10 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import median
+from typing import Literal
 
 from ..models.data import BenchmarkResult
+from ..shape_profiles import ShapeProfile, profile_weight, shape_profile_label, shape_profile_to_args
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +75,72 @@ def run_benchmark(
     except Exception as e:
         logger.error("Benchmark error: %s", e)
         return BenchmarkResult()
+
+
+def run_benchmark_multi(
+    executable_path: str | Path,
+    shape_profiles: list[ShapeProfile] | None,
+    warmup_rounds: int = 10,
+    measure_rounds: int = 100,
+    timeout: int = 300,
+    extra_args: list[str] | None = None,
+    aggregator: Literal["mean", "worst", "weighted"] = "mean",
+) -> BenchmarkResult:
+    """Run benchmark once per shape profile and aggregate latency."""
+    profiles = shape_profiles or [{}]
+    per_shape = []
+    for profile in profiles:
+        args = []
+        args.extend(shape_profile_to_args(profile))
+        if extra_args:
+            args.extend(extra_args)
+        result = run_benchmark(
+            executable_path,
+            warmup_rounds=warmup_rounds,
+            measure_rounds=measure_rounds,
+            timeout=timeout,
+            extra_args=args,
+        )
+        per_shape.append({
+            "shape": profile,
+            "shape_label": shape_profile_label(profile),
+            "latency_ms_median": result.latency_ms_median,
+            "latency_ms_p95": result.latency_ms_p95,
+            "throughput_gflops": result.throughput_gflops,
+            "extra": result.extra,
+        })
+
+    latencies = [float(item["latency_ms_median"]) for item in per_shape]
+    p95s = [float(item["latency_ms_p95"]) for item in per_shape]
+    if any(lat <= 0 for lat in latencies):
+        aggregate_latency = 0.0
+        aggregate_p95 = 0.0
+    elif aggregator == "worst":
+        aggregate_latency = max(latencies)
+        aggregate_p95 = max(p95s)
+    elif aggregator == "weighted":
+        weights = [profile_weight(profile) for profile in profiles]
+        weight_sum = sum(weights) or 1.0
+        aggregate_latency = sum(lat * weight for lat, weight in zip(latencies, weights)) / weight_sum
+        aggregate_p95 = sum(p95 * weight for p95, weight in zip(p95s, weights)) / weight_sum
+    else:
+        aggregate_latency = sum(latencies) / len(latencies)
+        aggregate_p95 = sum(p95s) / len(p95s)
+
+    worst_idx = max(range(len(per_shape)), key=lambda i: per_shape[i]["latency_ms_median"]) if per_shape else 0
+    return BenchmarkResult(
+        latency_ms_median=aggregate_latency,
+        latency_ms_p95=aggregate_p95,
+        throughput_gflops=None,
+        extra={
+            "aggregator": aggregator,
+            "aggregate_latency_ms": aggregate_latency,
+            "per_shape": per_shape,
+            "shape_count": len(per_shape),
+            "worst_shape": per_shape[worst_idx]["shape"] if per_shape else {},
+            "worst_shape_label": per_shape[worst_idx]["shape_label"] if per_shape else "default",
+        },
+    )
 
 
 def _parse_benchmark_output(stdout: str) -> BenchmarkResult:

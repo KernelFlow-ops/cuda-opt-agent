@@ -286,7 +286,7 @@ int main() { return 0; }
         }
 
         with patch.object(nodes, "compile_and_validate_node") as mock_compile, \
-             patch("cuda_opt_agent.agent.nodes.run_benchmark") as mock_benchmark:
+             patch("cuda_opt_agent.agent.nodes.run_benchmark_multi") as mock_benchmark:
             mock_compile.return_value = {
                 "trial_version_id": "v1",
                 "trial_compile_ok": True,

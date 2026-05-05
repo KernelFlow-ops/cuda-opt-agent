@@ -202,6 +202,47 @@ class TestBenchmarkTool:
         result = _parse_benchmark_output(output)
         assert result.latency_ms_median == 0.5
 
+    def test_run_benchmark_multi_worst_aggregator(self, monkeypatch, tmp_dir):
+        from cuda_opt_agent.models.data import BenchmarkResult
+        import cuda_opt_agent.tools.benchmark as benchmark_module
+
+        exe = tmp_dir / "kernel.exe"
+        exe.write_text("", encoding="utf-8")
+        calls = []
+
+        def fake_run_benchmark(executable_path, **kwargs):
+            calls.append(kwargs.get("extra_args"))
+            latency = 1.0 if len(calls) == 1 else 3.0
+            return BenchmarkResult(latency_ms_median=latency, latency_ms_p95=latency + 0.1)
+
+        monkeypatch.setattr(benchmark_module, "run_benchmark", fake_run_benchmark)
+        result = benchmark_module.run_benchmark_multi(
+            exe,
+            [{"M": 1024, "N": 1024, "K": 1024}, {"M": 2048, "N": 2048, "K": 2048}],
+            aggregator="worst",
+        )
+
+        assert result.latency_ms_median == 3.0
+        assert result.extra["shape_count"] == 2
+        assert result.extra["worst_shape"] == {"M": 2048, "N": 2048, "K": 2048}
+        assert calls[0] == ["--shape", "M=1024", "N=1024", "K=1024"]
+        assert calls[1] == ["--shape", "M=2048", "N=2048", "K=2048"]
+
+
+class TestShapeProfiles:
+    def test_parse_shape_profiles_power_syntax(self):
+        from cuda_opt_agent.shape_profiles import parse_shape_profiles
+        profiles = parse_shape_profiles("gemm", "1024^3;2048^3")
+        assert profiles == [
+            {"M": 1024, "N": 1024, "K": 1024},
+            {"M": 2048, "N": 2048, "K": 2048},
+        ]
+
+    def test_shape_profile_to_args(self):
+        from cuda_opt_agent.shape_profiles import shape_profile_to_args
+        args = shape_profile_to_args({"x": [1024, 1024], "_weight": 2})
+        assert args == ["--shape", "x=1024,1024"]
+
 
 class TestProfileTool:
     def test_parse_ncu_output(self):
@@ -239,6 +280,29 @@ class TestCorrectnessTool:
         result = _parse_correctness_output(output, 0, 1e-4, 1e-3)
         assert result.correct is True
         assert result.max_abs_error == 1e-5
+
+    def test_check_correctness_multi_passes_shape_args(self, monkeypatch, tmp_dir):
+        import cuda_opt_agent.tools.correctness as correctness_module
+        from cuda_opt_agent.tools.correctness import CorrectnessResult
+
+        exe = tmp_dir / "kernel.exe"
+        exe.write_text("", encoding="utf-8")
+        calls = []
+
+        def fake_check_correctness(executable_path, **kwargs):
+            calls.append(kwargs.get("extra_args"))
+            return CorrectnessResult(correct=True, max_abs_error=0.0, max_rel_error=0.0, message="ok")
+
+        monkeypatch.setattr(correctness_module, "check_correctness", fake_check_correctness)
+        results = correctness_module.check_correctness_multi(
+            exe,
+            [{"B": 1024, "N": 1024}, {"B": 4096, "N": 4096}],
+            dtype="fp16",
+        )
+
+        assert all(r["correct"] for r in results)
+        assert calls[0] == ["--shape", "B=1024", "N=1024"]
+        assert calls[1] == ["--shape", "B=4096", "N=4096"]
 
 
 class TestHardwareTool:

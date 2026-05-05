@@ -61,6 +61,7 @@ COMPILE_REPAIR_MAX_RETRIES=3
 HP_CANDIDATE_COUNT=5
 BENCHMARK_WARMUP_ROUNDS=10
 BENCHMARK_MEASURE_ROUNDS=100
+MULTI_SHAPE_AGGREGATOR=mean
 
 # 产物目录
 RUNS_DIR=runs
@@ -89,6 +90,12 @@ cuda-opt new softmax --spec tasks/softmax_fp16.yaml
 
 ```bash
 cuda-opt new softmax --task "写一个 fp16 softmax，沿最后一维归一化" --shape 1024,1024
+```
+
+多尺度 sweep:
+
+```bash
+cuda-opt run gemm --shapes "1024^3;2048^3;4096^3" --multi-shape-aggregator worst
 ```
 
 ### 优化已有 CUDA 文件
@@ -183,8 +190,11 @@ cuda-opt new [operator] [OPTIONS]
 | `--from-cu <file.cu>` | 以已有 `.cu` 作为 v0 seed |
 | `--sig <text>` | 算子签名 |
 | `--shape <dims>` | 逗号分隔 shape，如 `1024,1024` |
+| `--shapes <profiles>` | 分号分隔多 shape，如 `1024^3;2048^3` 或 `M=1024,N=1024,K=1024;M=2048,N=2048,K=2048` |
+| `--shape-profile <name>` | 使用内置 profile: `small`、`medium`、`large`、`sweep` |
 | `--dtype <dtype>` | 覆盖默认 dtype |
 | `--max-iters <n>` | 覆盖最大迭代数 |
+| `--multi-shape-aggregator <mode>` | 多 shape latency 聚合方式: `mean`、`worst`、`weighted` |
 | `--auto` | 禁用交互向导，缺少输入模式时报错 |
 
 ### 优化已有文件
@@ -201,8 +211,31 @@ cuda-opt tune <file.cu> [OPTIONS]
 | `--task <text>` | 补充任务语义 |
 | `--sig <text>` | 算子签名 |
 | `--shape <dims>` | 逗号分隔 shape |
+| `--shapes <profiles>` | 分号分隔多 shape profiles |
+| `--shape-profile <name>` | 使用内置 profile: `small`、`medium`、`large`、`sweep` |
 | `--dtype <dtype>` | 覆盖默认 dtype |
 | `--max-iters <n>` | 覆盖最大迭代数 |
+| `--multi-shape-aggregator <mode>` | 多 shape latency 聚合方式: `mean`、`worst`、`weighted` |
+
+### 多尺度验证
+
+`--shape` 保持旧单点行为；`--shapes` 和 `--shape-profile` 会对每个 shape profile 分别执行 correctness 与 benchmark。接受新版本的前提是所有 shape 都正确，且聚合 latency 相比 best 满足 `ACCEPT_EPSILON`。
+
+内置 profiles:
+
+| 算子 | profile | profiles |
+|------|---------|----------|
+| `gemm` | `small` / `medium` / `large` | `1024^3` / `2048^3` / `4096^3` |
+| `gemm` | `sweep` | `1024^3;2048^3;4096^3` |
+| `softmax` | `small` / `medium` / `large` | `B,N = 1024,1024` / `2048,2048` / `4096,4096` |
+| `softmax` | `sweep` | `B,N = 1024,1024;4096,4096` |
+
+生成的 `.cu` 必须支持通用命令行参数 `--shape key=value [key=value ...]`，例如:
+
+```bash
+./kernel --check --shape M=4096 N=4096 K=4096
+./kernel --warmup 10 --rounds 100 --shape B=4096 N=4096
+```
 
 ### 续跑
 
@@ -251,6 +284,7 @@ cuda-opt show-run runs/gemm_run_20260501T120000
 | `CONSECUTIVE_REJECT_LIMIT` | `--consecutive-reject-limit` | `5` | 连续拒绝后停止 |
 | `ACCEPT_EPSILON` | `--accept-epsilon` | `0.005` | 接受新版本所需相对提升 |
 | `HP_CANDIDATE_COUNT` | `--hp-candidate-count` | `5` | 每轮超参候选数量 |
+| `MULTI_SHAPE_AGGREGATOR` | `--multi-shape-aggregator` | `mean` | 多 shape latency 聚合方式 |
 
 仅 `.env` 配置项:
 
