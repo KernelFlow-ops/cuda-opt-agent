@@ -211,6 +211,57 @@ int main() { return 0; }
         assert "bottlenecks" in result["analysis_result"]
         assert llm.invoke_json.call_args.kwargs["temperature"] == 0.1
 
+    def test_profile_args_use_ncu_config(self, sample_agent_config):
+        config = sample_agent_config.model_copy(update={
+            "ncu_warmup_rounds": 3,
+            "ncu_profile_rounds": 2,
+        })
+        nodes, _, _ = self._make_nodes(config)
+        bm = BenchmarkResult(extra={"worst_shape": {"M": 128, "N": 256}})
+
+        assert nodes._profile_args_from_benchmark(bm) == [
+            "--shape", "M=128", "N=256",
+            "--warmup", "3",
+            "--rounds", "2",
+        ]
+
+    def test_profile_best_passes_ncu_launch_count(self, sample_agent_config,
+                                                  sample_operator_spec,
+                                                  sample_hardware_spec,
+                                                  sample_iteration_record):
+        config = sample_agent_config.model_copy(update={"ncu_launch_count": 7})
+        nodes, sm, _ = self._make_nodes(config)
+        sm.state = RunState(
+            run_id="test_run",
+            operator_spec=sample_operator_spec,
+            hardware_spec=sample_hardware_spec,
+            iterations=[sample_iteration_record],
+            current_best_id="v0",
+            config=config,
+        )
+        sm.run_dir = sm.persistence.create_run_dir("test")
+        iter_dir = sm.run_dir / "iterv0"
+        iter_dir.mkdir(parents=True, exist_ok=True)
+        exe_path = iter_dir / "kernel.exe"
+        exe_path.write_text("", encoding="utf-8")
+        code_path = iter_dir / "code.cu"
+        code_path.write_text("__global__ void k() {}", encoding="utf-8")
+
+        state: GraphState = {
+            "operator_spec": sample_operator_spec,
+            "hardware_spec": sample_hardware_spec,
+            "run_state": sm.state,
+        }
+        bm = BenchmarkResult(latency_ms_median=1.0, latency_ms_p95=1.1, extra={"worst_shape": {}})
+        ncu = NcuMetrics(sm_throughput_pct=10.0)
+
+        with patch.object(nodes, "_benchmark_multi", return_value=bm), \
+             patch("cuda_opt_agent.agent.nodes.profile.run_ncu_profile", return_value=ncu) as mock_profile:
+            result = nodes.profile_best_node(state)
+
+        assert result["current_ncu"] == ncu
+        assert mock_profile.call_args.kwargs["launch_count"] == 7
+
     def test_decide_node_normal(self, sample_agent_config, sample_operator_spec,
                                  sample_hardware_spec, sample_run_state,
                                  sample_benchmark_result):
@@ -603,6 +654,8 @@ int main() { return 0; }
         assert result["trial_version_id"] == "v1"
         assert result["trial_benchmark"] == fresh_benchmark
         assert result["trial_accepted"] is True
+        assert result["trial_compile_ok"] is True
+        assert result["trial_correctness_ok"] is True
 
     def test_evaluate_reuses_matching_trial_benchmark(self, sample_agent_config,
                                                       sample_operator_spec,
@@ -629,6 +682,8 @@ int main() { return 0; }
         mock_compile.assert_not_called()
         assert result["trial_benchmark"] == trial_benchmark
         assert result["trial_accepted"] is True
+        assert result["trial_compile_ok"] is True
+        assert result["trial_correctness_ok"] is True
 
     def test_terminate_node(self, sample_agent_config, sample_operator_spec,
                             sample_hardware_spec, sample_run_state):

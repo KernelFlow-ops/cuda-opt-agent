@@ -175,6 +175,9 @@ class AgentConfig(BaseModel):
     hp_compile_workers: int = 0
     benchmark_warmup_rounds: int = 10
     benchmark_measure_rounds: int = 100
+    ncu_launch_count: int = 3
+    ncu_warmup_rounds: int = 1
+    ncu_profile_rounds: int = 1
     multi_shape_aggregator: Literal["mean", "worst", "weighted"] = "mean"
     runs_dir: str = "runs"
     knowledge_base_dir: str = "knowledge_base"

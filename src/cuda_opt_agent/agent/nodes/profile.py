@@ -28,6 +28,7 @@ def profile_best_node(self, state: dict) -> dict:
         exe_path,
         output_report_path=best_dir / "ncu_report.txt",
         executable_args=self._profile_args_from_benchmark(bm),
+        launch_count=self.sm.config.ncu_launch_count,
     )
 
     code_path = self.sm.run_dir / best.code_path if best.code_path else best_dir / "code.cu"

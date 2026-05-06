@@ -53,7 +53,7 @@ class AgentNodes:
     _read_seed_code = staticmethod(_read_seed_code)
     _active_shape_profiles = staticmethod(_active_shape_profiles)
     _benchmark_multi = _benchmark_multi
-    _profile_args_from_benchmark = staticmethod(_profile_args_from_benchmark)
+    _profile_args_from_benchmark = _profile_args_from_benchmark
     _per_shape_summary = staticmethod(_per_shape_summary)
     _iteration_outcome_text = staticmethod(_iteration_outcome_text)
     _hyperparams_text = staticmethod(_hyperparams_text)

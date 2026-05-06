@@ -91,10 +91,13 @@ def _benchmark_multi(self, exe_path: Path, op) -> BenchmarkResult:
     )
 
 
-def _profile_args_from_benchmark(bm: BenchmarkResult) -> list[str]:
+def _profile_args_from_benchmark(self, bm: BenchmarkResult) -> list[str]:
     shape = bm.extra.get("worst_shape") if bm and bm.extra else None
     args = shape_profile_to_args(shape or {})
-    args.extend(["--warmup", "0", "--rounds", "1"])
+    args.extend([
+        "--warmup", str(self.sm.config.ncu_warmup_rounds),
+        "--rounds", str(self.sm.config.ncu_profile_rounds),
+    ])
     return args
 
 

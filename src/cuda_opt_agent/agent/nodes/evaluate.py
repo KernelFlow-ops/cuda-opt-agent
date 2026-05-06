@@ -25,6 +25,8 @@ def evaluate_node(self, state: dict) -> dict:
 
     if state.get("trial_benchmark") and state.get("trial_version_id") == version_id:
         trial_bm = state["trial_benchmark"]
+        trial_compile_ok = state.get("trial_compile_ok", True)
+        trial_correctness_ok = state.get("trial_correctness_ok", True)
     else:
         result = self.compile_and_validate_node(state)
         if not result.get("trial_compile_ok") or not result.get("trial_correctness_ok"):
@@ -39,6 +41,8 @@ def evaluate_node(self, state: dict) -> dict:
         iter_dir = self.sm.run_dir / f"iter{version_id}"
         exe_path = self._kernel_executable(iter_dir)
         trial_bm = self._benchmark_multi(exe_path, run_state.operator_spec)
+        trial_compile_ok = result.get("trial_compile_ok", False)
+        trial_correctness_ok = result.get("trial_correctness_ok", False)
 
     best_bm = state.get("current_benchmark", BenchmarkResult())
 
@@ -58,4 +62,6 @@ def evaluate_node(self, state: dict) -> dict:
         "trial_version_id": version_id,
         "trial_benchmark": trial_bm,
         "trial_accepted": accepted,
+        "trial_compile_ok": trial_compile_ok,
+        "trial_correctness_ok": trial_correctness_ok,
     }

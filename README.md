@@ -64,6 +64,9 @@ HP_CANDIDATE_COUNT=5
 HP_COMPILE_WORKERS=0
 BENCHMARK_WARMUP_ROUNDS=10
 BENCHMARK_MEASURE_ROUNDS=100
+NCU_LAUNCH_COUNT=3
+NCU_WARMUP_ROUNDS=1
+NCU_PROFILE_ROUNDS=1
 MULTI_SHAPE_AGGREGATOR=mean
 
 # 产物目录
@@ -322,6 +325,9 @@ cuda-opt show-run runs/gemm_run_20260501T120000
 | `COMPILE_REPAIR_MAX_RETRIES` | `3` | 编译/校验失败后的 LLM 修复重试次数 |
 | `BENCHMARK_WARMUP_ROUNDS` | `10` | benchmark warmup 轮数 |
 | `BENCHMARK_MEASURE_ROUNDS` | `100` | benchmark 测量轮数 |
+| `NCU_LAUNCH_COUNT` | `3` | ncu 每个 profiling phase 捕获的 kernel launch 数量 |
+| `NCU_WARMUP_ROUNDS` | `1` | ncu profiling 前传给 benchmark harness 的 warmup 轮数 |
+| `NCU_PROFILE_ROUNDS` | `1` | ncu profiling 时传给 benchmark harness 的测量轮数 |
 | `RUNS_DIR` | `runs` | 运行产物目录 |
 | `KNOWLEDGE_BASE_DIR` | `knowledge_base` | 跨运行知识库目录 |
 | `CONSOLE_ENCODING` | `auto` | 终端输出编码；可选 `auto`、`utf-8`、`gbk`、`default` |

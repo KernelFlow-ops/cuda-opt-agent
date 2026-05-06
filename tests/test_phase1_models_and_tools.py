@@ -277,6 +277,22 @@ class TestProfileTool:
         assert metrics.dram_throughput_pct is None
         assert metrics.extra["parse_error"] == "ncu csv header not found"
 
+    def test_parse_ncu_output_wide_csv(self):
+        from cuda_opt_agent.tools.profile import _parse_ncu_output
+        fake_output = '''==PROF== Connected
+"ID","Kernel Name","sm__throughput.avg.pct_of_peak_sustained_elapsed","gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed","dram__throughput.avg.pct_of_peak_sustained_elapsed","sm__warps_active.avg.pct_of_peak_sustained_elapsed","gpu__time_duration.sum"
+"","","%","%","%","%","nsecond"
+"0","rmsnorm_kernel","31.16","60.89","86.74","12","29696"
+'''
+        metrics = _parse_ncu_output(fake_output)
+        assert metrics.sm_throughput_pct == 31.16
+        assert metrics.compute_memory_throughput_pct == 60.89
+        assert metrics.dram_throughput_pct == 86.74
+        assert metrics.occupancy_pct == 12.0
+        assert metrics.extra["parser"] == "ncu_csv_raw"
+        assert metrics.extra["parser_format"] == "wide"
+        assert metrics.extra["metrics"]["gpu__time_duration.sum"] == 29696
+
     def test_run_ncu_profile_uses_csv_raw_page(self, monkeypatch, tmp_dir):
         import cuda_opt_agent.tools.profile as profile_module
 
@@ -300,13 +316,120 @@ class TestProfileTool:
 
         assert "--csv" in captured["cmd"]
         assert captured["cmd"][captured["cmd"].index("--page") + 1] == "raw"
+        assert captured["cmd"][captured["cmd"].index("--launch-count") + 1] == "3"
+        assert captured["cmd"][captured["cmd"].index("--warmup") + 1] == "1"
+        assert captured["cmd"][captured["cmd"].index("--rounds") + 1] == "1"
         assert metrics.sm_throughput_pct == 12.5
+
+    def test_run_ncu_profile_accepts_custom_launch_count(self, monkeypatch, tmp_dir):
+        import cuda_opt_agent.tools.profile as profile_module
+
+        exe = tmp_dir / "kernel.exe"
+        exe.write_text("", encoding="utf-8")
+        captured = {}
+
+        class Result:
+            returncode = 0
+            stdout = '"Metric Name","Metric Unit","Metric Value"\n"sm__throughput.avg.pct_of_peak_sustained_elapsed","%","12.5"\n'
+            stderr = ""
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return Result()
+
+        monkeypatch.setattr(profile_module.shutil, "which", lambda name: "ncu")
+        monkeypatch.setattr(profile_module.subprocess, "run", fake_run)
+
+        profile_module.run_ncu_profile(exe, output_report_path=tmp_dir / "ncu.csv", launch_count=5)
+
+        assert captured["cmd"][captured["cmd"].index("--launch-count") + 1] == "5"
+
+    def test_classify_ncu_bottleneck_paths(self):
+        import cuda_opt_agent.tools.profile as profile_module
+        from cuda_opt_agent.models.data import NcuMetrics
+
+        def make_metrics(values):
+            metrics = NcuMetrics(raw_text="")
+            metrics.extra["metrics"] = values
+            profile_module._populate_ncu_metric_fields(metrics)
+            return metrics
+
+        memory_metrics = make_metrics({
+            profile_module.METRIC_SM_THROUGHPUT: 30.0,
+            profile_module.METRIC_COMPUTE_MEMORY_THROUGHPUT: 72.0,
+            profile_module.METRIC_DRAM_THROUGHPUT: 68.0,
+            profile_module.METRIC_OCCUPANCY: 65.0,
+        })
+        compute_metrics = make_metrics({
+            profile_module.METRIC_SM_THROUGHPUT: 76.0,
+            profile_module.METRIC_DRAM_THROUGHPUT: 32.0,
+            profile_module.METRIC_OCCUPANCY: 70.0,
+        })
+        latency_metrics = make_metrics({
+            profile_module.METRIC_SM_THROUGHPUT: 18.0,
+            profile_module.METRIC_DRAM_THROUGHPUT: 12.0,
+            profile_module.METRIC_OCCUPANCY: 35.0,
+        })
+
+        assert profile_module.classify_ncu_bottleneck(memory_metrics) == "memory_bound"
+        assert profile_module.classify_ncu_bottleneck(compute_metrics) == "compute_bound"
+        assert profile_module.classify_ncu_bottleneck(latency_metrics) == "latency_bound"
+
+    def test_adaptive_profile_triggers_phase3_on_memory_saturation(self, monkeypatch, tmp_dir):
+        import cuda_opt_agent.tools.profile as profile_module
+        from cuda_opt_agent.models.data import NcuMetrics
+
+        exe = tmp_dir / "kernel.exe"
+        exe.write_text("", encoding="utf-8")
+        calls = []
+
+        def make_metrics(values, phase):
+            metrics = NcuMetrics(raw_text=phase)
+            metrics.extra.update({
+                "phase": phase,
+                "requested_metrics": list(values),
+                "metrics": values,
+                "metric_units": {},
+            })
+            profile_module._populate_ncu_metric_fields(metrics)
+            return metrics
+
+        def fake_run_ncu_metrics(executable_path, metrics, *, phase_name, **kwargs):
+            calls.append((phase_name, metrics))
+            if phase_name == "phase1":
+                return make_metrics({
+                    profile_module.METRIC_SM_THROUGHPUT: 35.0,
+                    profile_module.METRIC_COMPUTE_MEMORY_THROUGHPUT: 78.0,
+                    profile_module.METRIC_DRAM_THROUGHPUT: 88.0,
+                    profile_module.METRIC_OCCUPANCY: 62.0,
+                }, phase_name)
+            if phase_name == "phase2_memory":
+                return make_metrics({
+                    profile_module.METRIC_L2_HIT_RATE: 22.0,
+                    profile_module.METRIC_LONG_SCOREBOARD: 31.0,
+                }, phase_name)
+            return make_metrics({
+                profile_module.METRIC_FMA_PIPE: 45.0,
+                profile_module.METRIC_TENSOR_PIPE: 0.0,
+                profile_module.METRIC_MATH_PIPE_THROTTLE: 8.0,
+            }, phase_name)
+
+        monkeypatch.setattr(profile_module, "_run_ncu_metrics", fake_run_ncu_metrics)
+        result = profile_module.run_adaptive_ncu_profile(exe, output_report_path=tmp_dir / "ncu.txt")
+
+        assert [phase for phase, _ in calls] == ["phase1", "phase2_memory", "phase3_complementary"]
+        assert calls[1][1] == profile_module.MEMORY_METRICS
+        assert calls[2][1] == profile_module.PHASE3_COMPUTE_TOP3
+        assert result.extra["diagnosis"]["classification"] == "memory_bound"
+        assert result.extra["diagnosis"]["saturation"]["is_saturated"] is True
+        assert "算术强度" in result.extra["diagnosis"]["recommendation_hint"]
 
     def test_format_for_prompt(self, sample_ncu_metrics):
         from cuda_opt_agent.tools.profile import format_ncu_for_prompt
         text = format_ncu_for_prompt(sample_ncu_metrics)
         assert "DRAM" in text
         assert "92.1" in text
+        assert "classification" in text
 
 
 class TestCorrectnessTool:

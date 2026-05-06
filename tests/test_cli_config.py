@@ -15,6 +15,9 @@ CONFIG_ENV_KEYS = [
     "DECIDE_RESELECT_MAX_RETRIES",
     "HP_CANDIDATE_COUNT",
     "HP_COMPILE_WORKERS",
+    "NCU_LAUNCH_COUNT",
+    "NCU_WARMUP_ROUNDS",
+    "NCU_PROFILE_ROUNDS",
     "MULTI_SHAPE_AGGREGATOR",
 ]
 
@@ -136,6 +139,9 @@ def test_run_uses_env_defaults_when_cli_options_omitted(tmp_dir, monkeypatch):
             "DECIDE_RESELECT_MAX_RETRIES=6",
             "HP_CANDIDATE_COUNT=8",
             "HP_COMPILE_WORKERS=3",
+            "NCU_LAUNCH_COUNT=5",
+            "NCU_WARMUP_ROUNDS=2",
+            "NCU_PROFILE_ROUNDS=3",
         ]),
         encoding="utf-8",
     )
@@ -151,6 +157,9 @@ def test_run_uses_env_defaults_when_cli_options_omitted(tmp_dir, monkeypatch):
     assert config.decide_reselect_max_retries == 6
     assert config.hp_candidate_count == 8
     assert config.hp_compile_workers == 3
+    assert config.ncu_launch_count == 5
+    assert config.ncu_warmup_rounds == 2
+    assert config.ncu_profile_rounds == 3
     assert set(op_spec.dtypes.values()) == {"bf16"}
     assert "Max iterations: 50" in result.output
 
