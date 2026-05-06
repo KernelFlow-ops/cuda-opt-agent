@@ -121,7 +121,7 @@ class TestAgentNodesMocked:
     def test_init_node(self, sample_agent_config, sample_operator_spec):
         nodes, sm, llm = self._make_nodes(sample_agent_config)
 
-        with patch("cuda_opt_agent.agent.nodes.collect_hardware_info") as mock_hw:
+        with patch("cuda_opt_agent.agent.nodes.init.collect_hardware_info") as mock_hw:
             mock_hw.return_value = HardwareSpec(
                 gpu_name="Mock GPU",
                 compute_capability="sm_80",
@@ -150,6 +150,7 @@ int main() { return 0; }
         assert "current_code" in result
         assert "__global__" in result["current_code"]
         assert result["new_version_id"] == "v0"
+        assert llm.invoke.call_args.kwargs["temperature"] == 0.2
 
     def test_bootstrap_node_includes_seed_code(self, sample_agent_config,
                                                sample_operator_spec,
@@ -208,6 +209,7 @@ int main() { return 0; }
         result = nodes.analyze_node(state)
         assert "analysis_result" in result
         assert "bottlenecks" in result["analysis_result"]
+        assert llm.invoke_json.call_args.kwargs["temperature"] == 0.1
 
     def test_decide_node_normal(self, sample_agent_config, sample_operator_spec,
                                  sample_hardware_spec, sample_run_state,
@@ -237,6 +239,7 @@ int main() { return 0; }
         assert "method_decision" in result
         assert result["method_decision"].method_name == "shared_memory_tiling"
         assert result["has_hyperparams"] is True
+        assert llm.invoke_json.call_args.kwargs["temperature"] == 0.1
 
     def test_decide_node_includes_method_hp_history(self, sample_agent_config,
                                                     sample_operator_spec,
@@ -442,8 +445,8 @@ int main() { return 0; }
             ),
         }
 
-        with patch("cuda_opt_agent.agent.nodes.compile_cuda", side_effect=fake_compile), \
-             patch("cuda_opt_agent.agent.nodes.check_correctness_multi", side_effect=fake_correctness), \
+        with patch("cuda_opt_agent.agent.nodes._helpers.compile_cuda", side_effect=fake_compile), \
+             patch("cuda_opt_agent.agent.nodes.hp_search.check_correctness_multi", side_effect=fake_correctness), \
              patch.object(nodes, "_benchmark_multi", side_effect=fake_benchmark):
             result = nodes.hp_search_node(state)
 
@@ -451,6 +454,8 @@ int main() { return 0; }
         assert event_types == ["compile", "compile", "check", "bench", "check", "bench"]
         assert result["trial_benchmark"].latency_ms_median == 1.0
         assert result["new_version_id"].endswith("cand1")
+        assert llm.invoke_json.call_args.kwargs["temperature"] == 0.8
+        assert [call.kwargs["temperature"] for call in llm.invoke.call_args_list] == [0.25, 0.25]
 
     def test_hp_search_includes_known_hp_trials(self, sample_agent_config,
                                                 sample_operator_spec,
@@ -526,12 +531,35 @@ int main() { return 0; }
         assert record.hyperparams == {"tile": 128, "k": 32}
         assert sample_run_state.blacklist[-1].hyperparam_constraint == {"tile": 128, "k": 32}
         assert '{"k": 32, "tile": 128}' in llm.format_prompt.call_args.kwargs["hyperparams"]
+        assert llm.invoke_json.call_args.kwargs["temperature"] == 0.5
+
+    def test_apply_direct_uses_apply_temperature(self, sample_agent_config,
+                                                 sample_operator_spec,
+                                                 sample_hardware_spec,
+                                                 sample_run_state):
+        nodes, sm, llm = self._make_nodes(sample_agent_config)
+        llm.format_prompt.return_value = "prompt"
+        llm.invoke.return_value = "```cuda\n__global__ void k() {}\n```"
+
+        state: GraphState = {
+            "operator_spec": sample_operator_spec,
+            "hardware_spec": sample_hardware_spec,
+            "run_state": sample_run_state,
+            "current_ncu": NcuMetrics(),
+            "current_code": "__global__ void base() {}",
+            "method_decision": MethodDecision(method_name="warp_shuffle"),
+        }
+
+        result = nodes.apply_direct_node(state)
+
+        assert result["new_code"]
+        assert llm.invoke.call_args.kwargs["temperature"] == 0.25
 
     def test_hp_compile_worker_count_auto_uses_cpu_limit(self, sample_agent_config):
         config = sample_agent_config.model_copy(update={"hp_compile_workers": 0})
         nodes, _, _ = self._make_nodes(config)
 
-        with patch("cuda_opt_agent.agent.nodes.os.cpu_count", return_value=8):
+        with patch("cuda_opt_agent.agent.nodes._helpers.os.cpu_count", return_value=8):
             assert nodes._hp_compile_worker_count(5) == 5
 
         config = sample_agent_config.model_copy(update={"hp_compile_workers": 2})
@@ -561,7 +589,7 @@ int main() { return 0; }
         }
 
         with patch.object(nodes, "compile_and_validate_node") as mock_compile, \
-             patch("cuda_opt_agent.agent.nodes.run_benchmark_multi") as mock_benchmark:
+             patch("cuda_opt_agent.agent.nodes._helpers.run_benchmark_multi") as mock_benchmark:
             mock_compile.return_value = {
                 "trial_version_id": "v1",
                 "trial_compile_ok": True,

@@ -5,6 +5,8 @@ Phase 3 测试 —— LLM API 连通性 + Prompt 模板 + 结构化输出。
 
 import json
 import os
+import sys
+import types
 
 import pytest
 
@@ -140,6 +142,43 @@ That's my recommendation.'''
         monkeypatch.setattr(client, "invoke", lambda prompt: '{"status": "ok"}')
 
         assert client.invoke_structured("return json", dict) == {"status": "ok"}
+
+    def test_get_llm_caches_by_temperature(self, monkeypatch):
+        from cuda_opt_agent.agent.llm_client import LLMClient
+
+        created = []
+
+        class FakeChatAnthropic:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                created.append(self)
+
+        module = types.SimpleNamespace(ChatAnthropic=FakeChatAnthropic)
+        monkeypatch.setitem(sys.modules, "langchain_anthropic", module)
+
+        client = LLMClient(provider="anthropic", model="fake-model")
+        low_a = client._get_llm(temperature=0.1)
+        low_b = client._get_llm(temperature=0.1)
+        high = client._get_llm(temperature=0.8)
+
+        assert low_a is low_b
+        assert low_a is not high
+        assert [llm.kwargs["temperature"] for llm in created] == [0.1, 0.8]
+
+    def test_invoke_json_passes_temperature_to_invoke(self, monkeypatch):
+        from cuda_opt_agent.agent.llm_client import LLMClient
+
+        client = LLMClient()
+        seen = {}
+
+        def fake_invoke(prompt, temperature=None):
+            seen["temperature"] = temperature
+            return '{"ok": true}'
+
+        monkeypatch.setattr(client, "invoke", fake_invoke)
+
+        assert client.invoke_json("prompt", temperature=0.8) == {"ok": True}
+        assert seen["temperature"] == 0.8
 
 
 @pytest.mark.api

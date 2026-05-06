@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 # Prompt 模板目录
 PROMPTS_DIR = Path(__file__).parent / "prompts"
+DEFAULT_TEMPERATURE = 0.3
 
 
 def _normalize_openai_base_url(base_url: str | None) -> str | None:
@@ -37,27 +38,28 @@ class LLMClient:
     def __init__(self, provider: str = "anthropic", model: str = "claude-sonnet-4-20250514"):
         self.provider = provider
         self.model = model
-        self._llm = None
+        self._llm_cache: dict[float, Any] = {}
 
-    def _get_llm(self):
+    def _get_llm(self, temperature: float | None = None):
         """延迟初始化 LLM 实例。"""
-        if self._llm is not None:
-            return self._llm
+        temperature = DEFAULT_TEMPERATURE if temperature is None else temperature
+        if temperature in self._llm_cache:
+            return self._llm_cache[temperature]
 
         if self.provider == "anthropic":
             from langchain_anthropic import ChatAnthropic
-            self._llm = ChatAnthropic(
+            llm = ChatAnthropic(
                 model=self.model,
-                temperature=0.3,
+                temperature=temperature,
                 max_tokens=100000,
                 api_key=os.getenv("ANTHROPIC_API_KEY"),
                 base_url=os.getenv("ANTHROPIC_BASE_URL"),
             )
         elif self.provider == "openai":
             from langchain_openai import ChatOpenAI
-            self._llm = ChatOpenAI(
+            llm = ChatOpenAI(
                 model=self.model,
-                temperature=0.3,
+                temperature=temperature,
                 max_tokens=100000,
                 api_key=os.getenv("OPENAI_API_KEY"),
                 base_url=_normalize_openai_base_url(os.getenv("OPENAI_BASE_URL")),
@@ -67,7 +69,8 @@ class LLMClient:
         else:
             raise ValueError(f"Unsupported LLM provider: {self.provider}")
 
-        return self._llm
+        self._llm_cache[temperature] = llm
+        return llm
 
     def load_prompt(self, template_name: str) -> str:
         """加载 Prompt 模板。"""
@@ -77,12 +80,12 @@ class LLMClient:
         return path.read_text(encoding="utf-8")
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=30))
-    def invoke(self, prompt: str) -> str:
+    def invoke(self, prompt: str, temperature: float | None = None) -> str:
         """
         调用 LLM,返回文本响应。
         带自动重试。
         """
-        llm = self._get_llm()
+        llm = self._get_llm(temperature)
         logger.debug("LLM request length: %d chars", len(prompt))
         response = llm.invoke(prompt)
         text = self._response_to_text(response)
@@ -90,16 +93,16 @@ class LLMClient:
         return text
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=30))
-    def invoke_structured(self, prompt: str, schema: type) -> Any:
+    def invoke_structured(self, prompt: str, schema: type, temperature: float | None = None) -> Any:
         """
         调用 LLM 并解析结构化输出。
         使用 LangChain 的 with_structured_output。
         """
         if self.provider == "openai":
-            text = self.invoke(prompt)
+            text = self.invoke(prompt) if temperature is None else self.invoke(prompt, temperature=temperature)
             return self._manual_parse(text, schema)
 
-        llm = self._get_llm()
+        llm = self._get_llm(temperature)
         try:
             structured_llm = llm.with_structured_output(schema)
             result = structured_llm.invoke(prompt)
@@ -107,12 +110,12 @@ class LLMClient:
         except Exception as e:
             logger.warning("Structured output parsing failed; falling back to manual parsing: %s", e)
             # 降级: 调用普通 invoke 然后手动解析
-            text = self.invoke(prompt)
+            text = self.invoke(prompt) if temperature is None else self.invoke(prompt, temperature=temperature)
             return self._manual_parse(text, schema)
 
-    def invoke_json(self, prompt: str) -> dict:
+    def invoke_json(self, prompt: str, temperature: float | None = None) -> dict:
         """调用 LLM 并解析 JSON。"""
-        text = self.invoke(prompt)
+        text = self.invoke(prompt) if temperature is None else self.invoke(prompt, temperature=temperature)
         return self._extract_json(text)
 
     @staticmethod

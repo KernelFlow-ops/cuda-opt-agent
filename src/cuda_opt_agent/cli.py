@@ -720,7 +720,7 @@ def _list_runs_impl(runs_dir: str) -> None:
     console.print(table)
 
 
-@app.command("list-runs")
+@app.command("list-runs", hidden=True)
 def list_runs(
     runs_dir: str = typer.Option("runs", "--dir", help="Runs directory"),
 ) -> None:
@@ -752,7 +752,7 @@ def _show_run_impl(run_dir: str) -> None:
         raise typer.Exit(1)
 
 
-@app.command("show-run")
+@app.command("show-run", hidden=True)
 def show_run(
     run_dir: str = typer.Argument(..., help="Run directory path"),
 ) -> None:

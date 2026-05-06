@@ -70,6 +70,16 @@ def invoke_run(monkeypatch: pytest.MonkeyPatch, args: list[str]):
     return invoke_cli(monkeypatch, ["run", "gemm", *args])
 
 
+def test_help_hides_deprecated_list_and_show_aliases():
+    result = CliRunner().invoke(app, ["--help"])
+
+    assert result.exit_code == 0
+    assert "list-runs" not in result.output
+    assert "show-run" not in result.output
+    assert "list" in result.output
+    assert "show" in result.output
+
+
 def test_auto_console_encoding_uses_utf8_for_captured_windows_streams(monkeypatch):
     import cuda_opt_agent.cli as cli_module
 

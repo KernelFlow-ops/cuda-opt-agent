@@ -247,15 +247,60 @@ class TestShapeProfiles:
 class TestProfileTool:
     def test_parse_ncu_output(self):
         from cuda_opt_agent.tools.profile import _parse_ncu_output
+        fake_output = """==PROF== Connected to process
+"ID","Metric Name","Metric Unit","Metric Value"
+"1","sm__throughput.avg.pct_of_peak_sustained_elapsed","%","45.2"
+"1","gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed","%","51.5"
+"1","dram__throughput.avg.pct_of_peak_sustained_elapsed","%","92.1"
+"1","launch__registers_per_thread","register/thread","64"
+"1","launch__shared_mem_per_block","byte","1,024"
+"1","smsp__warp_issue_stalled_long_scoreboard.avg.pct_of_peak_sustained_elapsed","%","25.3"
+"""
+        metrics = _parse_ncu_output(fake_output)
+        assert metrics.raw_text == fake_output
+        assert metrics.sm_throughput_pct == 45.2
+        assert metrics.compute_memory_throughput_pct == 51.5
+        assert metrics.dram_throughput_pct == 92.1
+        assert metrics.registers_per_thread == 64
+        assert metrics.shared_mem_per_block_bytes == 1024
+        assert metrics.stall_reasons["long_scoreboard"] == 25.3
+        assert metrics.extra["parser"] == "ncu_csv_raw"
+
+    def test_parse_ncu_output_rejects_non_csv_text(self):
+        from cuda_opt_agent.tools.profile import _parse_ncu_output
         fake_output = """
         sm__throughput.avg.pct_of_peak_sustained_elapsed  45.2  45.2
         dram__throughput.avg.pct_of_peak_sustained_elapsed  92.1  92.1
-        launch__registers_per_thread  64
-        smsp__warp_issue_stalled_long_scoreboard.avg.pct  25.3  25.3
         """
         metrics = _parse_ncu_output(fake_output)
-        assert metrics.raw_text == fake_output
-        # 部分字段可能解析到,取决于正则匹配
+        assert metrics.sm_throughput_pct is None
+        assert metrics.dram_throughput_pct is None
+        assert metrics.extra["parse_error"] == "ncu csv header not found"
+
+    def test_run_ncu_profile_uses_csv_raw_page(self, monkeypatch, tmp_dir):
+        import cuda_opt_agent.tools.profile as profile_module
+
+        exe = tmp_dir / "kernel.exe"
+        exe.write_text("", encoding="utf-8")
+        captured = {}
+
+        class Result:
+            returncode = 0
+            stdout = '"Metric Name","Metric Unit","Metric Value"\n"sm__throughput.avg.pct_of_peak_sustained_elapsed","%","12.5"\n'
+            stderr = ""
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return Result()
+
+        monkeypatch.setattr(profile_module.shutil, "which", lambda name: "ncu")
+        monkeypatch.setattr(profile_module.subprocess, "run", fake_run)
+
+        metrics = profile_module.run_ncu_profile(exe, output_report_path=tmp_dir / "ncu.csv")
+
+        assert "--csv" in captured["cmd"]
+        assert captured["cmd"][captured["cmd"].index("--page") + 1] == "raw"
+        assert metrics.sm_throughput_pct == 12.5
 
     def test_format_for_prompt(self, sample_ncu_metrics):
         from cuda_opt_agent.tools.profile import format_ncu_for_prompt
