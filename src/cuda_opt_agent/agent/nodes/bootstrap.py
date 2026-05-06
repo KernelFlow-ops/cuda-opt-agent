@@ -9,7 +9,7 @@ from ..temperatures import TEMP_BOOTSTRAP
 logger = logging.getLogger(__name__)
 
 
-def bootstrap_node(self, state: dict) -> dict:
+async def bootstrap_node(self, state: dict) -> dict:
     """LLM 生成 v0 baseline。"""
     logger.info("=== BOOTSTRAP: generating v0 baseline ===")
     op = state["operator_spec"]
@@ -55,6 +55,6 @@ def bootstrap_node(self, state: dict) -> dict:
         kb_hints_section=kb_section,
     )
 
-    response = self.llm.invoke(prompt, temperature=TEMP_BOOTSTRAP)
+    response = await self.llm.ainvoke(prompt, temperature=TEMP_BOOTSTRAP, node_name="bootstrap")
     code = extract_cuda_code(response)
     return {"current_code": code, "new_version_id": "v0"}

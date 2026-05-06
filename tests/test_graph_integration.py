@@ -3,8 +3,9 @@
 使用 Mock LLM,不需要真实 API。
 """
 
+import asyncio
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -21,6 +22,10 @@ from cuda_opt_agent.models.data import (
     RunState,
     RunStatus,
 )
+
+
+def run_async(coro):
+    return asyncio.run(coro)
 
 
 class TestGraphRouting:
@@ -116,6 +121,9 @@ class TestAgentNodesMocked:
         sm = RunStateManager(config)
         kb = KnowledgeBase(config.knowledge_base_dir)
         llm = MagicMock(spec=LLMClient)
+        llm.ainvoke = AsyncMock()
+        llm.ainvoke_json = AsyncMock()
+        llm.ainvoke_structured = AsyncMock()
         return AgentNodes(state_manager=sm, kb=kb, llm=llm), sm, llm
 
     def test_init_node(self, sample_agent_config, sample_operator_spec):
@@ -127,7 +135,7 @@ class TestAgentNodesMocked:
                 compute_capability="sm_80",
             )
             state: GraphState = {"operator_spec": sample_operator_spec}
-            result = nodes.init_node(state)
+            result = run_async(nodes.init_node(state))
             assert "hardware_spec" in result
             assert result["hardware_spec"].gpu_name == "Mock GPU"
 
@@ -136,7 +144,7 @@ class TestAgentNodesMocked:
 
         # Mock LLM 返回
         llm.format_prompt.return_value = "test prompt"
-        llm.invoke.return_value = '''```cuda
+        llm.ainvoke.return_value = '''```cuda
 #include <cuda_runtime.h>
 __global__ void kernel() {}
 int main() { return 0; }
@@ -146,16 +154,16 @@ int main() { return 0; }
             "operator_spec": sample_operator_spec,
             "hardware_spec": sample_hardware_spec,
         }
-        result = nodes.bootstrap_node(state)
+        result = run_async(nodes.bootstrap_node(state))
         assert "current_code" in result
         assert "__global__" in result["current_code"]
         assert result["new_version_id"] == "v0"
-        assert llm.invoke.call_args.kwargs["temperature"] == 0.2
+        assert llm.ainvoke.call_args.kwargs["temperature"] == 0.2
 
     def test_bootstrap_node_includes_seed_code(self, sample_agent_config,
-                                               sample_operator_spec,
-                                               sample_hardware_spec,
-                                               tmp_dir):
+                                                     sample_operator_spec,
+                                                     sample_hardware_spec,
+                                                     tmp_dir):
         nodes, sm, llm = self._make_nodes(sample_agent_config)
         seed = tmp_dir / "seed.cu"
         seed.write_text("__global__ void seeded_kernel() {}\n", encoding="utf-8")
@@ -165,7 +173,7 @@ int main() { return 0; }
         })
 
         llm.format_prompt.return_value = "test prompt"
-        llm.invoke.return_value = '''```cuda
+        llm.ainvoke.return_value = '''```cuda
 #include <cuda_runtime.h>
 __global__ void kernel() {}
 int main() { return 0; }
@@ -175,7 +183,7 @@ int main() { return 0; }
             "operator_spec": op_spec,
             "hardware_spec": sample_hardware_spec,
         }
-        result = nodes.bootstrap_node(state)
+        result = run_async(nodes.bootstrap_node(state))
 
         _, kwargs = llm.format_prompt.call_args
         assert "seeded_kernel" in kwargs["seed_code_section"]
@@ -184,14 +192,14 @@ int main() { return 0; }
         assert result["new_version_id"] == "v0"
 
     def test_analyze_node(self, sample_agent_config, sample_operator_spec,
-                          sample_hardware_spec, sample_run_state,
-                          sample_ncu_metrics, sample_benchmark_result):
+                                sample_hardware_spec, sample_run_state,
+                                sample_ncu_metrics, sample_benchmark_result):
         nodes, sm, llm = self._make_nodes(sample_agent_config)
         sm.state = sample_run_state
         sm.run_dir = None  # 不需要实际目录
 
         llm.format_prompt.return_value = "test prompt"
-        llm.invoke_json.return_value = {
+        llm.ainvoke_json.return_value = {
             "bottlenecks": [
                 {"type": "memory_bound", "severity": 5, "evidence": "DRAM 92%", "description": "memory bound"}
             ],
@@ -206,10 +214,10 @@ int main() { return 0; }
             "current_benchmark": sample_benchmark_result,
             "current_code": "__global__ void k() {}",
         }
-        result = nodes.analyze_node(state)
+        result = run_async(nodes.analyze_node(state))
         assert "analysis_result" in result
         assert "bottlenecks" in result["analysis_result"]
-        assert llm.invoke_json.call_args.kwargs["temperature"] == 0.1
+        assert llm.ainvoke_json.call_args.kwargs["temperature"] == 0.1
 
     def test_profile_args_use_ncu_config(self, sample_agent_config):
         config = sample_agent_config.model_copy(update={
@@ -226,9 +234,9 @@ int main() { return 0; }
         ]
 
     def test_profile_best_passes_ncu_launch_count(self, sample_agent_config,
-                                                  sample_operator_spec,
-                                                  sample_hardware_spec,
-                                                  sample_iteration_record):
+                                                        sample_operator_spec,
+                                                        sample_hardware_spec,
+                                                        sample_iteration_record):
         config = sample_agent_config.model_copy(update={"ncu_launch_count": 7})
         nodes, sm, _ = self._make_nodes(config)
         sm.state = RunState(
@@ -257,19 +265,19 @@ int main() { return 0; }
 
         with patch.object(nodes, "_benchmark_multi", return_value=bm), \
              patch("cuda_opt_agent.agent.nodes.profile.run_ncu_profile", return_value=ncu) as mock_profile:
-            result = nodes.profile_best_node(state)
+            result = run_async(nodes.profile_best_node(state))
 
         assert result["current_ncu"] == ncu
         assert mock_profile.call_args.kwargs["launch_count"] == 7
 
     def test_decide_node_normal(self, sample_agent_config, sample_operator_spec,
-                                 sample_hardware_spec, sample_run_state,
-                                 sample_benchmark_result):
+                                      sample_hardware_spec, sample_run_state,
+                                      sample_benchmark_result):
         nodes, sm, llm = self._make_nodes(sample_agent_config)
         sm.state = sample_run_state
 
         llm.format_prompt.return_value = "test prompt"
-        llm.invoke_json.return_value = {
+        llm.ainvoke_json.return_value = {
             "method_name": "shared_memory_tiling",
             "has_hyperparams": True,
             "hyperparams_schema": {"tile_m": {"type": "int"}},
@@ -286,17 +294,17 @@ int main() { return 0; }
             "current_benchmark": sample_benchmark_result,
             "analysis_result": {"bottlenecks": []},
         }
-        result = nodes.decide_node(state)
+        result = run_async(nodes.decide_node(state))
         assert "method_decision" in result
         assert result["method_decision"].method_name == "shared_memory_tiling"
         assert result["has_hyperparams"] is True
-        assert llm.invoke_json.call_args.kwargs["temperature"] == 0.1
+        assert llm.ainvoke_json.call_args.kwargs["temperature"] == 0.1
 
     def test_decide_node_includes_method_hp_history(self, sample_agent_config,
-                                                    sample_operator_spec,
-                                                    sample_hardware_spec,
-                                                    sample_run_state,
-                                                    sample_benchmark_result):
+                                                          sample_operator_spec,
+                                                          sample_hardware_spec,
+                                                          sample_run_state,
+                                                          sample_benchmark_result):
         nodes, sm, llm = self._make_nodes(sample_agent_config)
         sm.state = sample_run_state
         sample_run_state.iterations.append(IterationRecord(
@@ -312,7 +320,7 @@ int main() { return 0; }
         ))
 
         llm.format_prompt.return_value = "test prompt"
-        llm.invoke_json.return_value = {
+        llm.ainvoke_json.return_value = {
             "method_name": "shared_memory_tiling",
             "has_hyperparams": True,
             "hyperparams_schema": {"tile": {"type": "int"}},
@@ -329,7 +337,7 @@ int main() { return 0; }
             "current_benchmark": sample_benchmark_result,
             "analysis_result": {},
         }
-        nodes.decide_node(state)
+        run_async(nodes.decide_node(state))
 
         method_history = llm.format_prompt.call_args.kwargs["method_history"]
         assert "v1_hp_cand0" in method_history
@@ -337,13 +345,13 @@ int main() { return 0; }
         assert "1.5000 ms" in method_history
 
     def test_decide_node_give_up(self, sample_agent_config, sample_operator_spec,
-                                 sample_hardware_spec, sample_run_state,
-                                 sample_benchmark_result):
+                                       sample_hardware_spec, sample_run_state,
+                                       sample_benchmark_result):
         nodes, sm, llm = self._make_nodes(sample_agent_config)
         sm.state = sample_run_state
 
         llm.format_prompt.return_value = "test prompt"
-        llm.invoke_json.return_value = {
+        llm.ainvoke_json.return_value = {
             "method_name": "none",
             "has_hyperparams": False,
             "rationale": "所有方向已尝试",
@@ -359,15 +367,15 @@ int main() { return 0; }
             "current_benchmark": sample_benchmark_result,
             "analysis_result": {},
         }
-        result = nodes.decide_node(state)
+        result = run_async(nodes.decide_node(state))
         assert result["should_stop"] is True
-        assert llm.invoke_json.call_count == 1
+        assert llm.ainvoke_json.call_count == 1
 
     def test_decide_node_reselects_blacklisted_method(self, sample_agent_config,
-                                                      sample_operator_spec,
-                                                      sample_hardware_spec,
-                                                      sample_run_state,
-                                                      sample_benchmark_result):
+                                                            sample_operator_spec,
+                                                            sample_hardware_spec,
+                                                            sample_run_state,
+                                                            sample_benchmark_result):
         nodes, sm, llm = self._make_nodes(sample_agent_config)
         sm.state = sample_run_state
         sample_run_state.blacklist.append(BlacklistEntry(
@@ -376,7 +384,7 @@ int main() { return 0; }
         ))
 
         llm.format_prompt.return_value = "test prompt"
-        llm.invoke_json.side_effect = [
+        llm.ainvoke_json.side_effect = [
             {
                 "method_name": "tiling",
                 "has_hyperparams": False,
@@ -402,19 +410,19 @@ int main() { return 0; }
             "current_benchmark": sample_benchmark_result,
             "analysis_result": {},
         }
-        result = nodes.decide_node(state)
+        result = run_async(nodes.decide_node(state))
 
         assert "should_stop" not in result
         assert result["method_decision"].method_name == "warp_shuffle"
-        assert llm.invoke_json.call_count == 2
+        assert llm.ainvoke_json.call_count == 2
         assert "tiling" in llm.format_prompt.call_args_list[1].kwargs["rejected_methods"]
 
     def test_decide_node_gives_up_after_reselect_retries_exhausted(self,
-                                                                  sample_agent_config,
-                                                                  sample_operator_spec,
-                                                                  sample_hardware_spec,
-                                                                  sample_run_state,
-                                                                  sample_benchmark_result):
+                                                                        sample_agent_config,
+                                                                        sample_operator_spec,
+                                                                        sample_hardware_spec,
+                                                                        sample_run_state,
+                                                                        sample_benchmark_result):
         config = sample_agent_config.model_copy(update={"decide_reselect_max_retries": 2})
         nodes, sm, llm = self._make_nodes(config)
         sm.state = sample_run_state
@@ -424,7 +432,7 @@ int main() { return 0; }
         ))
 
         llm.format_prompt.return_value = "test prompt"
-        llm.invoke_json.return_value = {
+        llm.ainvoke_json.return_value = {
             "method_name": "tiling",
             "has_hyperparams": False,
             "rationale": "still seems best",
@@ -440,28 +448,28 @@ int main() { return 0; }
             "current_benchmark": sample_benchmark_result,
             "analysis_result": {},
         }
-        result = nodes.decide_node(state)
+        result = run_async(nodes.decide_node(state))
 
         assert result["should_stop"] is True
         assert result["method_decision"].give_up is True
         assert "exhausted decide reselection retries" in result["stop_reason"]
-        assert llm.invoke_json.call_count == 3
+        assert llm.ainvoke_json.call_count == 3
 
     def test_hp_search_compiles_all_candidates_before_gpu_work(self, sample_agent_config,
-                                                               sample_operator_spec,
-                                                               sample_hardware_spec,
-                                                               sample_run_state):
+                                                                     sample_operator_spec,
+                                                                     sample_hardware_spec,
+                                                                     sample_run_state):
         config = sample_agent_config.model_copy(update={"hp_compile_workers": 1})
         nodes, sm, llm = self._make_nodes(config)
         sm.state = sample_run_state
         sm.run_dir = sm.persistence.create_run_dir("test")
 
         llm.format_prompt.return_value = "prompt"
-        llm.invoke_json.return_value = [
+        llm.ainvoke_json.return_value = [
             {"index": 0, "hyperparams": {"tile": 64}, "rationale": "safe"},
             {"index": 1, "hyperparams": {"tile": 128}, "rationale": "fast"},
         ]
-        llm.invoke.side_effect = [
+        llm.ainvoke.side_effect = [
             "```cuda\n__global__ void k0() {}\n```",
             "```cuda\n__global__ void k1() {}\n```",
         ]
@@ -499,19 +507,23 @@ int main() { return 0; }
         with patch("cuda_opt_agent.agent.nodes._helpers.compile_cuda", side_effect=fake_compile), \
              patch("cuda_opt_agent.agent.nodes.hp_search.check_correctness_multi", side_effect=fake_correctness), \
              patch.object(nodes, "_benchmark_multi", side_effect=fake_benchmark):
-            result = nodes.hp_search_node(state)
+            result = run_async(nodes.hp_search_node(state))
 
         event_types = [event[0] for event in events]
         assert event_types == ["compile", "compile", "check", "bench", "check", "bench"]
         assert result["trial_benchmark"].latency_ms_median == 1.0
         assert result["new_version_id"].endswith("cand1")
-        assert llm.invoke_json.call_args.kwargs["temperature"] == 0.8
-        assert [call.kwargs["temperature"] for call in llm.invoke.call_args_list] == [0.25, 0.25]
+        assert llm.ainvoke_json.call_args.kwargs["temperature"] == 0.8
+        assert [call.kwargs["temperature"] for call in llm.ainvoke.call_args_list] == [0.25, 0.25]
+        assert [call.kwargs["node_name"] for call in llm.ainvoke.call_args_list] == [
+            "hp_search:cand0",
+            "hp_search:cand1",
+        ]
 
     def test_hp_search_includes_known_hp_trials(self, sample_agent_config,
-                                                sample_operator_spec,
-                                                sample_hardware_spec,
-                                                sample_run_state):
+                                                      sample_operator_spec,
+                                                      sample_hardware_spec,
+                                                      sample_run_state):
         nodes, sm, llm = self._make_nodes(sample_agent_config)
         sm.state = sample_run_state
         sample_run_state.iterations.append(IterationRecord(
@@ -526,7 +538,7 @@ int main() { return 0; }
         ))
 
         llm.format_prompt.return_value = "prompt"
-        llm.invoke_json.return_value = []
+        llm.ainvoke_json.return_value = []
 
         state: GraphState = {
             "operator_spec": sample_operator_spec,
@@ -540,7 +552,7 @@ int main() { return 0; }
                 hyperparams_schema={"tile": {"type": "int"}},
             ),
         }
-        nodes.hp_search_node(state)
+        run_async(nodes.hp_search_node(state))
 
         known_hp_trials = llm.format_prompt.call_args.kwargs["known_hp_trials"]
         assert "v1_hp_cand0" in known_hp_trials
@@ -548,14 +560,14 @@ int main() { return 0; }
         assert "failed correctness" in known_hp_trials
 
     def test_reflect_records_selected_hp_candidate(self, sample_agent_config,
-                                                   sample_operator_spec,
-                                                   sample_hardware_spec,
-                                                   sample_run_state):
+                                                         sample_operator_spec,
+                                                         sample_hardware_spec,
+                                                         sample_run_state):
         nodes, sm, llm = self._make_nodes(sample_agent_config)
         sm.state = sample_run_state
         sm.run_dir = sm.persistence.create_run_dir("test")
         llm.format_prompt.return_value = "prompt"
-        llm.invoke_json.return_value = {"why_ineffective": "no speedup"}
+        llm.ainvoke_json.return_value = {"why_ineffective": "no speedup"}
 
         state: GraphState = {
             "operator_spec": sample_operator_spec,
@@ -575,22 +587,22 @@ int main() { return 0; }
                 }
             ],
         }
-        nodes.reflect_node(state)
+        run_async(nodes.reflect_node(state))
 
         record = sample_run_state.iter_by_id("v1_hp_cand0")
         assert record is not None
         assert record.hyperparams == {"tile": 128, "k": 32}
         assert sample_run_state.blacklist[-1].hyperparam_constraint == {"tile": 128, "k": 32}
         assert '{"k": 32, "tile": 128}' in llm.format_prompt.call_args.kwargs["hyperparams"]
-        assert llm.invoke_json.call_args.kwargs["temperature"] == 0.5
+        assert llm.ainvoke_json.call_args.kwargs["temperature"] == 0.5
 
     def test_apply_direct_uses_apply_temperature(self, sample_agent_config,
-                                                 sample_operator_spec,
-                                                 sample_hardware_spec,
-                                                 sample_run_state):
+                                                       sample_operator_spec,
+                                                       sample_hardware_spec,
+                                                       sample_run_state):
         nodes, sm, llm = self._make_nodes(sample_agent_config)
         llm.format_prompt.return_value = "prompt"
-        llm.invoke.return_value = "```cuda\n__global__ void k() {}\n```"
+        llm.ainvoke.return_value = "```cuda\n__global__ void k() {}\n```"
 
         state: GraphState = {
             "operator_spec": sample_operator_spec,
@@ -601,10 +613,10 @@ int main() { return 0; }
             "method_decision": MethodDecision(method_name="warp_shuffle"),
         }
 
-        result = nodes.apply_direct_node(state)
+        result = run_async(nodes.apply_direct_node(state))
 
         assert result["new_code"]
-        assert llm.invoke.call_args.kwargs["temperature"] == 0.25
+        assert llm.ainvoke.call_args.kwargs["temperature"] == 0.25
 
     def test_hp_compile_worker_count_auto_uses_cpu_limit(self, sample_agent_config):
         config = sample_agent_config.model_copy(update={"hp_compile_workers": 0})
@@ -618,9 +630,9 @@ int main() { return 0; }
         assert nodes._hp_compile_worker_count(5) == 2
 
     def test_evaluate_ignores_stale_trial_benchmark(self, sample_agent_config,
-                                                     sample_operator_spec,
-                                                     sample_hardware_spec,
-                                                     sample_run_state):
+                                                          sample_operator_spec,
+                                                          sample_hardware_spec,
+                                                          sample_run_state):
         nodes, sm, llm = self._make_nodes(sample_agent_config)
         sm.state = sample_run_state
         sm.run_dir = sm.persistence.create_run_dir("test")
@@ -639,7 +651,7 @@ int main() { return 0; }
             "trial_benchmark": stale_benchmark,
         }
 
-        with patch.object(nodes, "compile_and_validate_node") as mock_compile, \
+        with patch.object(nodes, "compile_and_validate_node", new_callable=AsyncMock) as mock_compile, \
              patch("cuda_opt_agent.agent.nodes._helpers.run_benchmark_multi") as mock_benchmark:
             mock_compile.return_value = {
                 "trial_version_id": "v1",
@@ -648,7 +660,7 @@ int main() { return 0; }
             }
             mock_benchmark.return_value = fresh_benchmark
 
-            result = nodes.evaluate_node(state)
+            result = run_async(nodes.evaluate_node(state))
 
         mock_compile.assert_called_once()
         assert result["trial_version_id"] == "v1"
@@ -658,9 +670,9 @@ int main() { return 0; }
         assert result["trial_correctness_ok"] is True
 
     def test_evaluate_reuses_matching_trial_benchmark(self, sample_agent_config,
-                                                      sample_operator_spec,
-                                                      sample_hardware_spec,
-                                                      sample_run_state):
+                                                            sample_operator_spec,
+                                                            sample_hardware_spec,
+                                                            sample_run_state):
         nodes, sm, llm = self._make_nodes(sample_agent_config)
         sm.state = sample_run_state
         sm.run_dir = sm.persistence.create_run_dir("test")
@@ -676,8 +688,8 @@ int main() { return 0; }
             "trial_benchmark": trial_benchmark,
         }
 
-        with patch.object(nodes, "compile_and_validate_node") as mock_compile:
-            result = nodes.evaluate_node(state)
+        with patch.object(nodes, "compile_and_validate_node", new_callable=AsyncMock) as mock_compile:
+            result = run_async(nodes.evaluate_node(state))
 
         mock_compile.assert_not_called()
         assert result["trial_benchmark"] == trial_benchmark
@@ -686,7 +698,7 @@ int main() { return 0; }
         assert result["trial_correctness_ok"] is True
 
     def test_terminate_node(self, sample_agent_config, sample_operator_spec,
-                            sample_hardware_spec, sample_run_state):
+                                  sample_hardware_spec, sample_run_state):
         nodes, sm, llm = self._make_nodes(sample_agent_config)
         sm.state = sample_run_state
         sm.run_dir = sm.persistence.create_run_dir("test")
@@ -695,7 +707,7 @@ int main() { return 0; }
             "run_state": sample_run_state,
             "stop_reason": "达到最大迭代数",
         }
-        result = nodes.terminate_node(state)
+        result = run_async(nodes.terminate_node(state))
         assert result["should_stop"] is True
         assert sm.state.status == RunStatus.DONE
 

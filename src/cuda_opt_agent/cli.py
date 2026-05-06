@@ -13,6 +13,7 @@ CLI 入口 —— 使用 Typer 构建命令行工具。
 
 from __future__ import annotations
 
+import asyncio
 import difflib
 import logging
 import os
@@ -99,6 +100,13 @@ def _setup_logging(level: str = "INFO", log_file: str | None = None) -> None:
         handlers=handlers,
         force=True,
     )
+
+
+def _streaming_enabled(no_stream: bool = False) -> bool:
+    if no_stream:
+        return False
+    value = os.getenv("LLM_STREAM", "true").strip().lower()
+    return value not in {"0", "false", "no", "off"}
 
 
 def _apply_config_overrides(
@@ -298,7 +306,7 @@ def _load_spec_mode(spec_file: str, operator: str | None, dtype_override: str | 
     return spec
 
 
-def _run_task(op_spec: OperatorSpec, *, config: AgentConfig) -> None:
+def _run_task(op_spec: OperatorSpec, *, config: AgentConfig, no_stream: bool = False) -> None:
     console.print(f"[bold cyan]Starting optimization: {op_spec.name}[/bold cyan]")
     if op_spec.signature:
         console.print(f"  Signature: {op_spec.signature}")
@@ -319,9 +327,10 @@ def _run_task(op_spec: OperatorSpec, *, config: AgentConfig) -> None:
     tui = CudaOptApp()
     tui.print_welcome()
 
-    from .agent.graph import run_optimization
+    from .agent.graph import run_optimization_async
     try:
-        final_state = run_optimization(op_spec, config=config)
+        stream_sink = tui.live_stream if _streaming_enabled(no_stream) else None
+        final_state = asyncio.run(run_optimization_async(op_spec, config=config, stream_sink=stream_sink))
         if final_state:
             tui.print_final_report(final_state)
     except KeyboardInterrupt:
@@ -408,6 +417,7 @@ def new(
     env_file: Optional[str] = typer.Option(None, "--env", help="Path to .env file"),
     log_level: str = typer.Option("INFO", "--log-level", help="Logging level"),
     log_file: Optional[str] = typer.Option(None, "--log-file", help="UTF-8 log file path"),
+    no_stream: bool = typer.Option(False, "--no-stream", help="Disable live LLM token streaming"),
     auto: bool = typer.Option(False, "--auto", help="Do not enter the interactive task wizard"),
 ) -> None:
     """Start a new optimization task from a spec file, text task, seed code, or wizard."""
@@ -462,7 +472,7 @@ def new(
         console.print(f"[red]Invalid task input: {e}[/red]")
         raise typer.Exit(1)
 
-    _run_task(op_spec, config=config)
+    _run_task(op_spec, config=config, no_stream=no_stream)
 
 
 @app.command()
@@ -513,6 +523,7 @@ def tune(
     env_file: Optional[str] = typer.Option(None, "--env", help="Path to .env file"),
     log_level: str = typer.Option("INFO", "--log-level", help="Logging level"),
     log_file: Optional[str] = typer.Option(None, "--log-file", help="UTF-8 log file path"),
+    no_stream: bool = typer.Option(False, "--no-stream", help="Disable live LLM token streaming"),
 ) -> None:
     """Optimize an existing .cu implementation as the v0 baseline."""
     _setup_logging(log_level, log_file)
@@ -542,7 +553,7 @@ def tune(
         console.print(f"[red]Invalid task input: {e}[/red]")
         raise typer.Exit(1)
 
-    _run_task(op_spec, config=config)
+    _run_task(op_spec, config=config, no_stream=no_stream)
 
 
 @app.command()
@@ -591,6 +602,7 @@ def run(
     env_file: Optional[str] = typer.Option(None, "--env", help="Path to .env file"),
     log_level: str = typer.Option("INFO", "--log-level", help="Logging level"),
     log_file: Optional[str] = typer.Option(None, "--log-file", help="UTF-8 log file path"),
+    no_stream: bool = typer.Option(False, "--no-stream", help="Disable live LLM token streaming"),
     auto: bool = typer.Option(False, "--auto", help="Run without interactive intervention"),
 ) -> None:
     """Compatibility entrypoint; prefer `cuda-opt new` for new tasks."""
@@ -614,7 +626,7 @@ def run(
         shape_profile=shape_profile,
         dtype=config.default_dtype,
     )
-    _run_task(op_spec, config=config)
+    _run_task(op_spec, config=config, no_stream=no_stream)
 
 
 @app.command()
@@ -625,6 +637,7 @@ def resume(
     env_file: Optional[str] = typer.Option(None, "--env", help="Path to .env file"),
     log_level: str = typer.Option("INFO", "--log-level", help="Logging level"),
     log_file: Optional[str] = typer.Option(None, "--log-file", help="UTF-8 log file path"),
+    no_stream: bool = typer.Option(False, "--no-stream", help="Disable live LLM token streaming"),
 ) -> None:
     """Resume an existing optimization run."""
     _setup_logging(log_level, log_file)
@@ -656,18 +669,20 @@ def resume(
         console.print("[red]Specify an operator name, run id, or run directory[/red]")
         raise typer.Exit(1)
 
-    from .agent.graph import run_optimization
+    from .agent.graph import run_optimization_async
     from .tui.app import CudaOptApp
 
     tui = CudaOptApp()
     tui.print_welcome()
 
     try:
-        final_state = run_optimization(
+        stream_sink = tui.live_stream if _streaming_enabled(no_stream) else None
+        final_state = asyncio.run(run_optimization_async(
             operator_spec=OperatorSpec(name=operator or "", signature=""),
             config=config,
             resume_dir=resolved_run_dir,
-        )
+            stream_sink=stream_sink,
+        ))
         if final_state:
             tui.print_final_report(final_state)
     except KeyboardInterrupt:

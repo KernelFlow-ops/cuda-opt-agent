@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from ...models.data import BenchmarkResult, NcuMetrics
@@ -8,7 +9,7 @@ from ...tools.profile import run_ncu_profile
 logger = logging.getLogger(__name__)
 
 
-def profile_best_node(self, state: dict) -> dict:
+async def profile_best_node(self, state: dict) -> dict:
     """对当前 best 进行 benchmark + ncu profiling。"""
     logger.info("=== PROFILE BEST ===")
     run_state = state["run_state"]
@@ -23,8 +24,9 @@ def profile_best_node(self, state: dict) -> dict:
     if not exe_path.exists():
         raise FileNotFoundError(f"Best executable not found: {exe_path}")
 
-    bm = self._benchmark_multi(exe_path, run_state.operator_spec)
-    ncu = run_ncu_profile(
+    bm = await asyncio.to_thread(self._benchmark_multi, exe_path, run_state.operator_spec)
+    ncu = await asyncio.to_thread(
+        run_ncu_profile,
         exe_path,
         output_report_path=best_dir / "ncu_report.txt",
         executable_args=self._profile_args_from_benchmark(bm),
@@ -32,12 +34,12 @@ def profile_best_node(self, state: dict) -> dict:
     )
 
     code_path = self.sm.run_dir / best.code_path if best.code_path else best_dir / "code.cu"
-    code = code_path.read_text(encoding="utf-8") if code_path.exists() else ""
+    code = await asyncio.to_thread(code_path.read_text, encoding="utf-8") if code_path.exists() else ""
 
     best.benchmark = bm
     best.ncu_metrics = ncu
     best.ncu_report_path = str((best_dir / "ncu_report.txt").relative_to(self.sm.run_dir))
-    self.sm._save()
+    await asyncio.to_thread(self.sm._save)
 
     return {
         "current_benchmark": bm,

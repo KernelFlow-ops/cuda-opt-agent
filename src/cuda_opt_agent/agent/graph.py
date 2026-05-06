@@ -5,6 +5,7 @@ LangGraph 状态机 —— 编排整个迭代优化流程。
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -14,7 +15,7 @@ from ..config import get_api_key, load_config
 from ..memory.knowledge import KnowledgeBase
 from ..memory.run_state import RunStateManager
 from ..models.data import AgentConfig, HardwareSpec, OperatorSpec, RunState, RunStatus
-from .llm_client import LLMClient
+from .llm_client import LLMClient, LLMStreamSink
 from .nodes import AgentNodes
 from .state import GraphState
 
@@ -27,6 +28,7 @@ def build_graph(
     kb: KnowledgeBase | None = None,
     llm: LLMClient | None = None,
     entry_point: str = "init",
+    stream_sink: LLMStreamSink | None = None,
 ) -> StateGraph:
     """
     构建 LangGraph 状态机。
@@ -51,9 +53,11 @@ def build_graph(
         kb = KnowledgeBase(config.knowledge_base_dir)
 
     if llm is None:
-        llm = LLMClient(provider=config.llm_provider, model=config.llm_model)
+        llm = LLMClient(provider=config.llm_provider, model=config.llm_model, stream_sink=stream_sink)
+    elif stream_sink is not None:
+        llm.stream_sink = stream_sink
 
-    nodes = AgentNodes(state_manager=state_manager, kb=kb, llm=llm)
+    nodes = AgentNodes(state_manager=state_manager, kb=kb, llm=llm, stream_sink=stream_sink)
 
     # ── 构建图 ──
     graph = StateGraph(GraphState)
@@ -139,6 +143,26 @@ def run_optimization(
     operator_spec: OperatorSpec,
     config: AgentConfig | None = None,
     resume_dir: str | None = None,
+    stream_sink: LLMStreamSink | None = None,
+) -> RunState:
+    """Synchronous compatibility wrapper around the async optimization path."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(run_optimization_async(
+            operator_spec,
+            config=config,
+            resume_dir=resume_dir,
+            stream_sink=stream_sink,
+        ))
+    raise RuntimeError("run_optimization() cannot be used from a running event loop; use run_optimization_async().")
+
+
+async def run_optimization_async(
+    operator_spec: OperatorSpec,
+    config: AgentConfig | None = None,
+    resume_dir: str | None = None,
+    stream_sink: LLMStreamSink | None = None,
 ) -> RunState:
     """
     运行完整的优化流程。
@@ -156,7 +180,7 @@ def run_optimization(
 
     state_manager = RunStateManager(config)
     kb = KnowledgeBase(config.knowledge_base_dir)
-    llm = LLMClient(provider=config.llm_provider, model=config.llm_model)
+    llm = LLMClient(provider=config.llm_provider, model=config.llm_model, stream_sink=stream_sink)
 
     # 新建或续跑
     if resume_dir:
@@ -165,8 +189,8 @@ def run_optimization(
             raise RuntimeError(f"Could not resume from {resume_dir}")
     else:
         from ..tools.hardware import collect_hardware_info
-        hw = collect_hardware_info()
-        run_state = state_manager.init_new_run(operator_spec, hw)
+        hw = await asyncio.to_thread(collect_hardware_info)
+        run_state = await asyncio.to_thread(state_manager.init_new_run, operator_spec, hw)
 
     entry_point = "profile_best" if resume_dir and run_state.iterations else "init"
     graph = build_graph(
@@ -175,6 +199,7 @@ def run_optimization(
         kb=kb,
         llm=llm,
         entry_point=entry_point,
+        stream_sink=stream_sink,
     )
     compiled = graph.compile()
 
@@ -195,15 +220,15 @@ def run_optimization(
 
     # 运行
     try:
-        final_state = compiled.invoke(initial_state)
+        final_state = await compiled.ainvoke(initial_state)
         return state_manager.state
     except KeyboardInterrupt:
         logger.info("Interrupted by user (Ctrl+C); saving state...")
         if state_manager.state:
             state_manager.state.status = RunStatus.PAUSED
-            state_manager._save()
+            await asyncio.to_thread(state_manager._save)
         return state_manager.state
     except Exception as e:
         logger.error("Run failed with exception: %s", e, exc_info=True)
-        state_manager.mark_failed()
+        await asyncio.to_thread(state_manager.mark_failed)
         raise

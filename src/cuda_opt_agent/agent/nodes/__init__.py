@@ -44,10 +44,12 @@ class AgentNodes:
         state_manager: RunStateManager,
         kb: KnowledgeBase,
         llm: LLMClient,
+        stream_sink=None,
     ):
         self.sm = state_manager
         self.kb = kb
         self.llm = llm
+        self.stream_sink = stream_sink
 
     _operator_context = staticmethod(_operator_context)
     _read_seed_code = staticmethod(_read_seed_code)

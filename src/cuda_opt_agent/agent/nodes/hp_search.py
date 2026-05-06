@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -14,7 +15,7 @@ from ..temperatures import TEMP_APPLY_METHOD, TEMP_PROPOSE_HP
 logger = logging.getLogger(__name__)
 
 
-def hp_search_node(self, state: dict) -> dict:
+async def hp_search_node(self, state: dict) -> dict:
     """LLM 提出多组超参候选,逐一编译+测速。"""
     logger.info("=== HP SEARCH ===")
     decision = state["method_decision"]
@@ -35,7 +36,11 @@ def hp_search_node(self, state: dict) -> dict:
         hp_count=self.sm.config.hp_candidate_count,
     )
 
-    candidates_raw = self.llm.invoke_json(prompt, temperature=TEMP_PROPOSE_HP)
+    candidates_raw = await self.llm.ainvoke_json(
+        prompt,
+        temperature=TEMP_PROPOSE_HP,
+        node_name="hp_search",
+    )
     if isinstance(candidates_raw, dict):
         candidates_raw = candidates_raw.get("candidates", [candidates_raw])
 
@@ -67,9 +72,13 @@ def hp_search_node(self, state: dict) -> dict:
             ncu_key_metrics=format_ncu_for_prompt(ncu)[:2000],
         )
 
-        response = self.llm.invoke(apply_prompt, temperature=TEMP_APPLY_METHOD)
+        response = await self.llm.ainvoke(
+            apply_prompt,
+            temperature=TEMP_APPLY_METHOD,
+            node_name=f"hp_search:cand{cand.index}",
+        )
         code = extract_cuda_code(response)
-        code_path = self.sm.persistence.save_code(code, iter_dir)
+        code_path = await asyncio.to_thread(self.sm.persistence.save_code, code, iter_dir)
 
         candidate_records[version_id] = {
             "candidate": cand,
@@ -86,7 +95,7 @@ def hp_search_node(self, state: dict) -> dict:
         })
 
     results = []
-    compiled_candidates = self._compile_hp_candidates(compile_jobs)
+    compiled_candidates = await asyncio.to_thread(self._compile_hp_candidates, compile_jobs)
 
     for compiled in compiled_candidates:
         version_id = compiled["version_id"]
@@ -103,12 +112,17 @@ def hp_search_node(self, state: dict) -> dict:
         exe_path = Path(compiled["output_path"])
 
         dtype = list(op.dtypes.values())[0] if op.dtypes else "fp32"
-        correctness_results = check_correctness_multi(exe_path, self._active_shape_profiles(op), dtype=dtype)
+        correctness_results = await asyncio.to_thread(
+            check_correctness_multi,
+            exe_path,
+            self._active_shape_profiles(op),
+            dtype=dtype,
+        )
         if not all(r.get("correct") for r in correctness_results):
             logger.warning("Candidate %d correctness check failed: %s", cand.index, summarize_correctness_results(correctness_results))
             continue
 
-        bm = self._benchmark_multi(exe_path, op)
+        bm = await asyncio.to_thread(self._benchmark_multi, exe_path, op)
         results.append({
             "index": cand.index,
             "version_id": version_id,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from ...models.data import BenchmarkResult
@@ -7,7 +8,7 @@ from ...models.data import BenchmarkResult
 logger = logging.getLogger(__name__)
 
 
-def evaluate_node(self, state: dict) -> dict:
+async def evaluate_node(self, state: dict) -> dict:
     """评估 v★ 是否优于 best。"""
     logger.info("=== EVALUATE ===")
     run_state = state["run_state"]
@@ -28,7 +29,7 @@ def evaluate_node(self, state: dict) -> dict:
         trial_compile_ok = state.get("trial_compile_ok", True)
         trial_correctness_ok = state.get("trial_correctness_ok", True)
     else:
-        result = self.compile_and_validate_node(state)
+        result = await self.compile_and_validate_node(state)
         if not result.get("trial_compile_ok") or not result.get("trial_correctness_ok"):
             return {
                 "trial_version_id": version_id,
@@ -40,7 +41,7 @@ def evaluate_node(self, state: dict) -> dict:
 
         iter_dir = self.sm.run_dir / f"iter{version_id}"
         exe_path = self._kernel_executable(iter_dir)
-        trial_bm = self._benchmark_multi(exe_path, run_state.operator_spec)
+        trial_bm = await asyncio.to_thread(self._benchmark_multi, exe_path, run_state.operator_spec)
         trial_compile_ok = result.get("trial_compile_ok", False)
         trial_correctness_ok = result.get("trial_correctness_ok", False)
 

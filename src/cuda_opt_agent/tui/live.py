@@ -36,6 +36,8 @@ class LiveReasoningStream:
 
     def start(self) -> None:
         """开始 Live 渲染。"""
+        if self._live:
+            return
         self._live = Live(console=self.console, refresh_per_second=4)
         self._live.start()
 
@@ -44,6 +46,27 @@ class LiveReasoningStream:
         if self._live:
             self._live.stop()
             self._live = None
+
+    def __enter__(self) -> "LiveReasoningStream":
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.stop()
+
+    def start_node(self, node_name: str) -> None:
+        """LLM stream sink hook: begin rendering one node."""
+        self.start()
+        self.set_node(node_name)
+
+    def on_token(self, chunk: str) -> None:
+        """LLM stream sink hook: append token text."""
+        self.append(chunk)
+
+    def on_error(self, error: BaseException | str) -> None:
+        """LLM stream sink hook: render an error and stop live output."""
+        self.stop()
+        self.console.print(f"[red]LLM stream error: {error}[/red]")
 
     def set_node(self, node_name: str) -> None:
         """切换到新节点。"""
@@ -80,6 +103,7 @@ class LiveReasoningStream:
     def finish_node(self, summary: str = "") -> None:
         """完成当前节点。"""
         color = NODE_COLORS.get(self._current_node, "white")
+        self.stop()
         self.console.print(
             f"  [{color}]DONE {self._current_node}[/{color}]"
             + (f": {summary}" if summary else "")

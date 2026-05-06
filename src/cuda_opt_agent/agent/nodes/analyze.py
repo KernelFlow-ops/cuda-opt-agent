@@ -9,7 +9,7 @@ from ..temperatures import TEMP_ANALYZE
 logger = logging.getLogger(__name__)
 
 
-def analyze_node(self, state: dict) -> dict:
+async def analyze_node(self, state: dict) -> dict:
     """LLM 分析瓶颈。"""
     logger.info("=== ANALYZE ===")
     run_state = state["run_state"]
@@ -53,5 +53,5 @@ def analyze_node(self, state: dict) -> dict:
         kb_hints=hints_text,
     )
 
-    analysis = self.llm.invoke_json(prompt, temperature=TEMP_ANALYZE)
+    analysis = await self.llm.ainvoke_json(prompt, temperature=TEMP_ANALYZE, node_name="analyze")
     return {"analysis_result": analysis}

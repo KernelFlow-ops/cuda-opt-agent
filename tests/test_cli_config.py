@@ -5,6 +5,8 @@ from typer.testing import CliRunner
 
 from cuda_opt_agent.cli import app
 
+SENTINEL_STREAM = object()
+
 
 CONFIG_ENV_KEYS = [
     "CONSOLE_ENCODING",
@@ -23,6 +25,9 @@ CONFIG_ENV_KEYS = [
 
 
 class DummyTui:
+    def __init__(self):
+        self.live_stream = SENTINEL_STREAM
+
     def print_welcome(self) -> None:
         pass
 
@@ -51,16 +56,17 @@ def clear_config_env(monkeypatch: pytest.MonkeyPatch) -> None:
 def invoke_cli(monkeypatch: pytest.MonkeyPatch, args: list[str]):
     captured = {}
 
-    def fake_run_optimization(operator_spec, config=None, resume_dir=None):
+    async def fake_run_optimization_async(operator_spec, config=None, resume_dir=None, stream_sink=None):
         captured["operator_spec"] = operator_spec
         captured["config"] = config
         captured["resume_dir"] = resume_dir
+        captured["stream_sink"] = stream_sink
         return None
 
     import cuda_opt_agent.agent.graph as graph_module
     import cuda_opt_agent.tui.app as tui_module
 
-    monkeypatch.setattr(graph_module, "run_optimization", fake_run_optimization)
+    monkeypatch.setattr(graph_module, "run_optimization_async", fake_run_optimization_async)
     monkeypatch.setattr(tui_module, "CudaOptApp", DummyTui)
 
     result = CliRunner().invoke(app, args)
@@ -162,6 +168,30 @@ def test_run_uses_env_defaults_when_cli_options_omitted(tmp_dir, monkeypatch):
     assert config.ncu_profile_rounds == 3
     assert set(op_spec.dtypes.values()) == {"bf16"}
     assert "Max iterations: 50" in result.output
+    assert captured["stream_sink"] is SENTINEL_STREAM
+
+
+def test_run_no_stream_passes_none(tmp_dir, monkeypatch):
+    clear_config_env(monkeypatch)
+
+    captured, _ = invoke_run(
+        monkeypatch,
+        ["--no-stream", "--env", str(tmp_dir / "missing.env")],
+    )
+
+    assert captured["stream_sink"] is None
+
+
+def test_run_llm_stream_env_false_passes_none(tmp_dir, monkeypatch):
+    clear_config_env(monkeypatch)
+    monkeypatch.setenv("LLM_STREAM", "false")
+
+    captured, _ = invoke_run(
+        monkeypatch,
+        ["--env", str(tmp_dir / "missing.env")],
+    )
+
+    assert captured["stream_sink"] is None
 
 
 def test_run_cli_options_override_env_defaults(tmp_dir, monkeypatch):

@@ -4,11 +4,13 @@ LLM 客户端抽象 —— 使用 LangChain 封装,支持 Anthropic / OpenAI。
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 import logging
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -18,6 +20,41 @@ logger = logging.getLogger(__name__)
 # Prompt 模板目录
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 DEFAULT_TEMPERATURE = 0.3
+
+
+class LLMStreamSink(Protocol):
+    """Receives live LLM output for UI rendering."""
+
+    def start_node(self, node_name: str) -> None:
+        ...
+
+    def on_token(self, chunk: str) -> None:
+        ...
+
+    def finish_node(self, summary: str = "") -> None:
+        ...
+
+    def on_error(self, error: BaseException | str) -> None:
+        ...
+
+
+async def _maybe_call(target: Any, method_name: str, *args: Any) -> None:
+    if target is None:
+        return
+    method = getattr(target, method_name, None)
+    if method is None:
+        return
+    result = method(*args)
+    if inspect.isawaitable(result):
+        await result
+
+
+def _run_async_compat(coro):
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    raise RuntimeError("Cannot call synchronous LLM API from a running event loop; use the async API instead.")
 
 
 def _normalize_openai_base_url(base_url: str | None) -> str | None:
@@ -35,9 +72,15 @@ def _normalize_openai_base_url(base_url: str | None) -> str | None:
 class LLMClient:
     """LLM 调用封装。"""
 
-    def __init__(self, provider: str = "anthropic", model: str = "claude-sonnet-4-20250514"):
+    def __init__(
+        self,
+        provider: str = "anthropic",
+        model: str = "claude-sonnet-4-20250514",
+        stream_sink: LLMStreamSink | None = None,
+    ):
         self.provider = provider
         self.model = model
+        self.stream_sink = stream_sink
         self._llm_cache: dict[float, Any] = {}
 
     def _get_llm(self, temperature: float | None = None):
@@ -85,11 +128,70 @@ class LLMClient:
         调用 LLM,返回文本响应。
         带自动重试。
         """
+        if self.stream_sink is not None:
+            return _run_async_compat(self.ainvoke(prompt, temperature=temperature))
+
         llm = self._get_llm(temperature)
         logger.debug("LLM request length: %d chars", len(prompt))
         response = llm.invoke(prompt)
         text = self._response_to_text(response)
         logger.debug("LLM response length: %d chars", len(text))
+        return text
+
+    async def ainvoke(
+        self,
+        prompt: str,
+        temperature: float | None = None,
+        *,
+        node_name: str | None = None,
+        stream_sink: LLMStreamSink | None = None,
+    ) -> str:
+        """Async LLM call. Uses streaming when a sink is available."""
+        return await self.astream_text(
+            prompt,
+            temperature=temperature,
+            node_name=node_name,
+            stream_sink=stream_sink,
+        )
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=30))
+    async def astream_text(
+        self,
+        prompt: str,
+        temperature: float | None = None,
+        *,
+        node_name: str | None = None,
+        stream_sink: LLMStreamSink | None = None,
+    ) -> str:
+        """Stream an LLM response token-by-token and return the complete text."""
+        llm = self._get_llm(temperature)
+        sink = stream_sink if stream_sink is not None else self.stream_sink
+        logger.debug("LLM request length: %d chars", len(prompt))
+
+        if sink is not None and node_name:
+            await _maybe_call(sink, "start_node", node_name)
+
+        parts: list[str] = []
+        try:
+            async for chunk in llm.astream(prompt):
+                text = self._chunk_to_text(chunk)
+                if not text:
+                    continue
+                parts.append(text)
+                await _maybe_call(sink, "on_token", text)
+        except NotImplementedError:
+            response = await llm.ainvoke(prompt)
+            text = self._response_to_text(response)
+            parts.append(text)
+            await _maybe_call(sink, "on_token", text)
+        except Exception as e:
+            await _maybe_call(sink, "on_error", e)
+            raise
+
+        text = "".join(parts)
+        logger.debug("LLM response length: %d chars", len(text))
+        if sink is not None and node_name:
+            await _maybe_call(sink, "finish_node", f"{len(text)} chars")
         return text
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=30))
@@ -118,9 +220,47 @@ class LLMClient:
         text = self.invoke(prompt) if temperature is None else self.invoke(prompt, temperature=temperature)
         return self._extract_json(text)
 
+    async def ainvoke_structured(
+        self,
+        prompt: str,
+        schema: type,
+        temperature: float | None = None,
+        *,
+        node_name: str | None = None,
+        stream_sink: LLMStreamSink | None = None,
+    ) -> Any:
+        """Async structured output via streamed raw text followed by schema parsing."""
+        text = await self.ainvoke(
+            prompt,
+            temperature=temperature,
+            node_name=node_name,
+            stream_sink=stream_sink,
+        )
+        return self._manual_parse(text, schema)
+
+    async def ainvoke_json(
+        self,
+        prompt: str,
+        temperature: float | None = None,
+        *,
+        node_name: str | None = None,
+        stream_sink: LLMStreamSink | None = None,
+    ) -> dict:
+        """Async LLM call with streamed raw output followed by JSON parsing."""
+        text = await self.ainvoke(
+            prompt,
+            temperature=temperature,
+            node_name=node_name,
+            stream_sink=stream_sink,
+        )
+        return self._extract_json(text)
+
     @staticmethod
     def _response_to_text(response: Any) -> str:
         """Extract plain text from LangChain messages across Chat and Responses APIs."""
+        if isinstance(response, str):
+            return response
+
         text_attr = getattr(response, "text", None)
         if isinstance(text_attr, str):
             return text_attr
@@ -129,22 +269,42 @@ class LLMClient:
             if isinstance(text, str):
                 return text
 
-        content = getattr(response, "content", None)
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            parts: list[str] = []
-            for item in content:
-                if isinstance(item, dict):
-                    text = item.get("text")
-                    if isinstance(text, str):
-                        parts.append(text)
-                elif isinstance(item, str):
-                    parts.append(item)
-            if parts:
-                return "".join(parts)
+        content_text = LLMClient._content_to_text(getattr(response, "content", None))
+        if content_text:
+            return content_text
+
+        content_blocks_text = LLMClient._content_to_text(getattr(response, "content_blocks", None))
+        if content_blocks_text:
+            return content_blocks_text
 
         return str(response)
+
+    @staticmethod
+    def _chunk_to_text(chunk: Any) -> str:
+        """Extract text from streaming chunks."""
+        return LLMClient._response_to_text(chunk)
+
+    @staticmethod
+    def _content_to_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            return ""
+
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+                continue
+            text = getattr(item, "text", None)
+            if isinstance(text, str):
+                parts.append(text)
+        return "".join(parts)
 
     @staticmethod
     def _extract_json(text: str) -> dict:

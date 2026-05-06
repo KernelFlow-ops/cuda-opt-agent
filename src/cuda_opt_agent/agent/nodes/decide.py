@@ -10,7 +10,7 @@ from ..temperatures import TEMP_DECIDE
 logger = logging.getLogger(__name__)
 
 
-def decide_node(self, state: dict) -> dict:
+async def decide_node(self, state: dict) -> dict:
     """LLM 决策下一个优化方法。"""
     logger.info("=== DECIDE ===")
     run_state = state["run_state"]
@@ -64,7 +64,11 @@ def decide_node(self, state: dict) -> dict:
     decision: MethodDecision | None = None
     max_reselects = max(0, self.sm.config.decide_reselect_max_retries)
     for attempt in range(max_reselects + 1):
-        decision_data = self.llm.invoke_json(build_prompt(), temperature=TEMP_DECIDE)
+        decision_data = await self.llm.ainvoke_json(
+            build_prompt(),
+            temperature=TEMP_DECIDE,
+            node_name="decide",
+        )
         decision = MethodDecision.model_validate(decision_data)
 
         if decision.give_up:

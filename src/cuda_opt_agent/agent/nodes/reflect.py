@@ -9,7 +9,7 @@ from ..temperatures import TEMP_REFLECT
 logger = logging.getLogger(__name__)
 
 
-def reflect_node(self, state: dict) -> dict:
+async def reflect_node(self, state: dict) -> dict:
     """LLM 反思:为什么有效/无效。"""
     logger.info("=== REFLECT ===")
     decision = state.get("method_decision", MethodDecision(method_name="unknown"))
@@ -51,7 +51,7 @@ def reflect_node(self, state: dict) -> dict:
             ncu_report="(see ncu report)",
         )
 
-    reflection = self.llm.invoke_json(prompt, temperature=TEMP_REFLECT)
+    reflection = await self.llm.ainvoke_json(prompt, temperature=TEMP_REFLECT, node_name="reflect")
 
     version_id = state.get("new_version_id", "unknown")
     code_path = ""

@@ -3,12 +3,17 @@ Phase 3 测试 —— LLM API 连通性 + Prompt 模板 + 结构化输出。
 标记 @pytest.mark.api 的测试需要真实 API key。
 """
 
+import asyncio
 import json
 import os
 import sys
 import types
 
 import pytest
+
+
+def run_async(coro):
+    return asyncio.run(coro)
 
 
 def _load_api_env():
@@ -122,6 +127,70 @@ That's my recommendation.'''
             ]
 
         assert LLMClient._response_to_text(Message()) == "OK DONE"
+
+    def test_response_to_text_from_content_blocks_attribute(self):
+        from cuda_opt_agent.agent.llm_client import LLMClient
+
+        class Block:
+            def __init__(self, text):
+                self.text = text
+
+        class Message:
+            content = []
+            content_blocks = [Block("A"), {"type": "text", "text": "B"}]
+
+        assert LLMClient._response_to_text(Message()) == "AB"
+
+    def test_astream_text_sends_tokens_to_sink(self, monkeypatch):
+        from cuda_opt_agent.agent.llm_client import LLMClient
+
+        class FakeLLM:
+            async def astream(self, prompt):
+                yield "OK"
+                yield " DONE"
+
+        class Sink:
+            def __init__(self):
+                self.events = []
+
+            def start_node(self, node_name):
+                self.events.append(("start", node_name))
+
+            def on_token(self, chunk):
+                self.events.append(("token", chunk))
+
+            def finish_node(self, summary=""):
+                self.events.append(("finish", summary))
+
+            def on_error(self, error):
+                self.events.append(("error", str(error)))
+
+        sink = Sink()
+        client = LLMClient(stream_sink=sink)
+        monkeypatch.setattr(client, "_get_llm", lambda temperature=None: FakeLLM())
+
+        text = run_async(client.astream_text("prompt", temperature=0.4, node_name="analyze"))
+
+        assert text == "OK DONE"
+        assert sink.events[:3] == [
+            ("start", "analyze"),
+            ("token", "OK"),
+            ("token", " DONE"),
+        ]
+        assert sink.events[-1][0] == "finish"
+
+    def test_ainvoke_json_streams_then_parses(self, monkeypatch):
+        from cuda_opt_agent.agent.llm_client import LLMClient
+
+        class FakeLLM:
+            async def astream(self, prompt):
+                yield '{"ok":'
+                yield ' true}'
+
+        client = LLMClient()
+        monkeypatch.setattr(client, "_get_llm", lambda temperature=None: FakeLLM())
+
+        assert run_async(client.ainvoke_json("prompt", temperature=0.8, node_name="decide")) == {"ok": True}
 
     def test_openai_client_uses_responses_api(self, monkeypatch):
         from cuda_opt_agent.agent.llm_client import LLMClient

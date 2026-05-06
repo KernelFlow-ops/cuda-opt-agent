@@ -10,7 +10,7 @@ from ..temperatures import TEMP_APPLY_METHOD
 logger = logging.getLogger(__name__)
 
 
-def apply_direct_node(self, state: dict) -> dict:
+async def apply_direct_node(self, state: dict) -> dict:
     """LLM 在 best 基础上应用方法 M(不含超参)。"""
     logger.info("=== APPLY DIRECT ===")
     decision = state["method_decision"]
@@ -31,7 +31,7 @@ def apply_direct_node(self, state: dict) -> dict:
         ncu_key_metrics=format_ncu_for_prompt(ncu)[:2000],
     )
 
-    response = self.llm.invoke(prompt, temperature=TEMP_APPLY_METHOD)
+    response = await self.llm.ainvoke(prompt, temperature=TEMP_APPLY_METHOD, node_name="apply_direct")
     code = extract_cuda_code(response)
     version_id = state["run_state"].next_version_id(has_hp=False)
 
