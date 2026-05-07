@@ -1,9 +1,15 @@
 """
 配置加载 —— 从 .env 文件读取,构建 AgentConfig。
+
+[优化] 新增字段加载: gpu_ids, correctness_max_parallel, nvcc_parallel_threads,
+hp_llm_concurrency, use_code_diff, use_tool_use
+
+[修复] 新增字段加载: hp_correctness_repair_max
 """
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -18,7 +24,6 @@ def load_config(env_path: str | Path | None = None) -> AgentConfig:
     优先级: 环境变量 > .env 文件 > 默认值。
     """
     if env_path is None:
-        # 从项目根目录向上查找 .env
         candidates = [
             Path.cwd() / ".env",
             Path(__file__).resolve().parent.parent.parent / ".env",
@@ -36,6 +41,15 @@ def load_config(env_path: str | Path | None = None) -> AgentConfig:
         llm_model = os.getenv("OPENAI_MODEL", os.getenv("LLM_MODEL", "gpt-4o"))
     else:
         llm_model = os.getenv("ANTHROPIC_MODEL", os.getenv("LLM_MODEL", "claude-sonnet-4-20250514"))
+
+    # [优化] 解析 GPU_IDS: 逗号分隔的 GPU 索引, 如 "0,1,2,3"
+    gpu_ids_str = os.getenv("GPU_IDS", "")
+    gpu_ids: list[int] = []
+    if gpu_ids_str.strip():
+        try:
+            gpu_ids = [int(x.strip()) for x in gpu_ids_str.split(",") if x.strip()]
+        except ValueError:
+            gpu_ids = []
 
     return AgentConfig(
         llm_provider=llm_provider,
@@ -56,6 +70,15 @@ def load_config(env_path: str | Path | None = None) -> AgentConfig:
         multi_shape_aggregator=os.getenv("MULTI_SHAPE_AGGREGATOR", "mean"),
         runs_dir=os.getenv("RUNS_DIR", "runs"),
         knowledge_base_dir=os.getenv("KNOWLEDGE_BASE_DIR", "knowledge_base"),
+        # [优化] 新增字段
+        gpu_ids=gpu_ids,
+        correctness_max_parallel=int(os.getenv("CORRECTNESS_MAX_PARALLEL", "2")),
+        nvcc_parallel_threads=int(os.getenv("NVCC_PARALLEL_THREADS", "0")),
+        hp_llm_concurrency=int(os.getenv("HP_LLM_CONCURRENCY", "3")),
+        use_code_diff=os.getenv("USE_CODE_DIFF", "true").strip().lower() in {"1", "true", "yes", "on"},
+        use_tool_use=os.getenv("USE_TOOL_USE", "true").strip().lower() in {"1", "true", "yes", "on"},
+        # [修复] 新增字段
+        hp_correctness_repair_max=int(os.getenv("HP_CORRECTNESS_REPAIR_MAX", "2")),
     )
 
 

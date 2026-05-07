@@ -143,6 +143,7 @@ COMPILE_REPAIR_MAX_RETRIES=3
 DECIDE_RESELECT_MAX_RETRIES=3
 HP_CANDIDATE_COUNT=5
 HP_COMPILE_WORKERS=0
+HP_LLM_CONCURRENCY=3
 
 # Benchmark / profiling
 BENCHMARK_WARMUP_ROUNDS=10
@@ -151,6 +152,15 @@ NCU_LAUNCH_COUNT=3
 NCU_WARMUP_ROUNDS=1
 NCU_PROFILE_ROUNDS=1
 MULTI_SHAPE_AGGREGATOR=mean
+CORRECTNESS_MAX_PARALLEL=2
+
+# CUDA / GPU execution
+NVCC_PARALLEL_THREADS=0
+GPU_IDS=
+
+# LLM / prompt modes
+USE_TOOL_USE=true
+USE_CODE_DIFF=true
 
 # Outputs
 RUNS_DIR=runs
@@ -165,7 +175,7 @@ CONSOLE_ENCODING=auto
 ### Natural Language
 
 ```bash
-cuda-opt new batchnorm --task "写一个 fp16 batchnorm"
+cuda-opt new layernorm --task "写一个 fp16 layernorm"
 ```
 
 ### Structured Spec
@@ -267,7 +277,7 @@ NCU profile 分阶段执行：
 
 ### HP Search
 
-当方法带超参时，Agent 让 LLM 生成多组候选。候选代码串行生成、可并行编译；正确性和 benchmark 串行执行，避免同一 GPU 上并发测量互相干扰。
+当方法带超参时，Agent 让 LLM 生成多组候选。候选代码按 `HP_LLM_CONCURRENCY` 并发生成；编译完成的候选会立即进入 correctness + benchmark 流水线。多 shape correctness 可按 `CORRECTNESS_MAX_PARALLEL` 并行执行，多 GPU 环境可通过 `GPU_IDS` 分发候选并为每张 GPU 串行化 benchmark，避免同卡竞争。
 
 ### Evaluate And Reflect
 

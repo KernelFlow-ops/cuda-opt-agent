@@ -1,11 +1,17 @@
 """
-数值正确性校验 —— 将 kernel 输出与参考实现(PyTorch / cuBLAS)对比。
+数值正确性校验 —— 将 kernel 输出与参考实现对比。
+
+[优化]:
+  - 新增 check_correctness_multi_async: 基于 asyncio 的跨 shape 并行校验
+  - 新增 gpu_id 参数支持多 GPU 分发
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,27 +63,12 @@ def check_correctness(
     rtol: float | None = None,
     timeout: int = 120,
     extra_args: list[str] | None = None,
+    gpu_id: int | None = None,
 ) -> CorrectnessResult:
     """
     运行正确性校验可执行文件。
 
-    可执行文件需要输出 JSON:
-    {
-        "correct": true/false,
-        "max_abs_error": 1e-5,
-        "max_rel_error": 1e-4,
-        "message": "..."
-    }
-
-    Args:
-        executable_path: 校验可执行文件路径
-        dtype: 数据类型 (用于选择容差)
-        atol: 自定义绝对容差
-        rtol: 自定义相对容差
-        timeout: 超时秒数
-
-    Returns:
-        CorrectnessResult
+    [优化] 新增 gpu_id 参数, 用于多 GPU 分发。
     """
     exe = Path(executable_path)
     if not exe.exists():
@@ -96,12 +87,19 @@ def check_correctness(
     if extra_args:
         cmd.extend(extra_args)
 
+    # [优化] 设置 CUDA_VISIBLE_DEVICES 用于多 GPU 校验
+    env = None
+    if gpu_id is not None:
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
     try:
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=env,
         )
 
         return _parse_correctness_output(
@@ -132,8 +130,9 @@ def check_correctness_multi(
     rtol: float | None = None,
     timeout: int = 120,
     extra_args: list[str] | None = None,
+    gpu_id: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Run correctness once per shape profile."""
+    """Run correctness once per shape profile (串行, 向后兼容)."""
     profiles = shape_profiles or [{}]
     results = []
     for profile in profiles:
@@ -148,6 +147,7 @@ def check_correctness_multi(
             rtol=rtol,
             timeout=timeout,
             extra_args=args,
+            gpu_id=gpu_id,
         )
         results.append({
             "shape": profile,
@@ -161,6 +161,95 @@ def check_correctness_multi(
             "details": result.details,
         })
     return results
+
+
+async def check_correctness_multi_async(
+    executable_path: str | Path,
+    shape_profiles: list[ShapeProfile] | None,
+    dtype: str = "fp32",
+    atol: float | None = None,
+    rtol: float | None = None,
+    timeout: int = 120,
+    extra_args: list[str] | None = None,
+    gpu_id: int | None = None,
+    max_parallel: int = 2,
+) -> list[dict[str, Any]]:
+    """
+    [优化] 跨 shape 并行正确性校验。
+
+    使用 asyncio.Semaphore 控制并发数, 避免 GPU OOM。
+    对小 shape 的校验可安全并发; 大 shape 仍受 semaphore 限制。
+
+    Args:
+        max_parallel: 最大并行校验数 (默认 2, 避免 GPU 竞争)
+    """
+    profiles = shape_profiles or [{}]
+
+    if len(profiles) <= 1 or max_parallel <= 1:
+        # 单 shape 或禁用并行, 走串行路径
+        return await asyncio.to_thread(
+            check_correctness_multi,
+            executable_path,
+            shape_profiles,
+            dtype=dtype,
+            atol=atol,
+            rtol=rtol,
+            timeout=timeout,
+            extra_args=extra_args,
+            gpu_id=gpu_id,
+        )
+
+    semaphore = asyncio.Semaphore(max_parallel)
+
+    async def _check_one(profile: ShapeProfile) -> dict[str, Any]:
+        async with semaphore:
+            args = list(shape_profile_to_args(profile))
+            if extra_args:
+                args.extend(extra_args)
+            result = await asyncio.to_thread(
+                check_correctness,
+                executable_path,
+                dtype=dtype,
+                atol=atol,
+                rtol=rtol,
+                timeout=timeout,
+                extra_args=args,
+                gpu_id=gpu_id,
+            )
+            return {
+                "shape": profile,
+                "shape_label": shape_profile_label(profile),
+                "correct": result.correct,
+                "max_abs_error": result.max_abs_error,
+                "max_rel_error": result.max_rel_error,
+                "atol_used": result.atol_used,
+                "rtol_used": result.rtol_used,
+                "message": result.message,
+                "details": result.details,
+            }
+
+    tasks = [_check_one(p) for p in profiles]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    final = []
+    for i, r in enumerate(results):
+        if isinstance(r, Exception):
+            logger.warning("Correctness check for shape %s failed: %s",
+                           shape_profile_label(profiles[i]), r)
+            final.append({
+                "shape": profiles[i],
+                "shape_label": shape_profile_label(profiles[i]),
+                "correct": False,
+                "max_abs_error": float("inf"),
+                "max_rel_error": float("inf"),
+                "atol_used": 0.0,
+                "rtol_used": 0.0,
+                "message": f"Exception: {r}",
+                "details": {},
+            })
+        else:
+            final.append(r)
+    return final
 
 
 def summarize_correctness_results(results: list[dict[str, Any]]) -> str:
@@ -194,7 +283,6 @@ def _parse_correctness_output(
     except json.JSONDecodeError:
         pass
 
-    # Fallback: 用 return code 判断
     return CorrectnessResult(
         correct=returncode == 0,
         atol_used=atol,
@@ -215,3 +303,5 @@ def save_correctness_result(result: CorrectnessResult, output_path: str | Path) 
         "message": result.message,
     }
     output_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+

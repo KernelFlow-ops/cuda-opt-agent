@@ -158,3 +158,5 @@ def _parse_raw_dump_extras(spec: HardwareSpec) -> None:
     if spec.l2_cache_mb == 0:
         defaults = {"sm_90": 50, "sm_89": 72, "sm_86": 6, "sm_80": 40, "sm_75": 4, "sm_70": 6}
         spec.l2_cache_mb = defaults.get(spec.compute_capability, 4)
+
+

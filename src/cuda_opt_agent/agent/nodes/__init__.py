@@ -4,10 +4,15 @@ from ...memory.knowledge import KnowledgeBase
 from ...memory.run_state import RunStateManager
 from ..llm_client import LLMClient
 from ._helpers import (
+    GpuPool,
     _active_shape_profiles,
     _benchmark_multi,
-    _compile_hp_candidates,
+    _build_code_diff_context,
     _compile_hp_candidate_job,
+    _compile_hp_candidates,
+    _compile_hp_candidates_async,
+    _iter_compile_hp_candidates_async,
+    _generate_code_diff,
     _generate_final_report,
     _hardware_summary,
     _hp_compile_worker_count,
@@ -27,7 +32,7 @@ from .bootstrap import bootstrap_node
 from .compile_validate import _repair_code, compile_and_validate_node
 from .decide import decide_node
 from .evaluate import evaluate_node
-from .hp_search import hp_search_node
+from .hp_search import hp_search_node, _smart_truncate_code, _build_correctness_failure_history
 from .init import init_node
 from .profile import profile_best_node
 from .reflect import reflect_node
@@ -67,6 +72,11 @@ class AgentNodes:
     _kernel_executable = staticmethod(_kernel_executable)
     _generate_final_report = _generate_final_report
 
+    # [优化] 新增
+    _build_code_diff_context = staticmethod(_build_code_diff_context)
+    _generate_code_diff = staticmethod(_generate_code_diff)
+    _iter_compile_hp_candidates_async = staticmethod(_iter_compile_hp_candidates_async)
+
     init_node = init_node
     bootstrap_node = bootstrap_node
     compile_and_validate_node = compile_and_validate_node
@@ -81,4 +91,6 @@ class AgentNodes:
     terminate_node = terminate_node
 
 
-__all__ = ["AgentNodes", "_compile_hp_candidate_job"]
+__all__ = ["AgentNodes", "_compile_hp_candidate_job", "_iter_compile_hp_candidates_async", "GpuPool"]
+
+

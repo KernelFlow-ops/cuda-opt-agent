@@ -127,3 +127,5 @@ def build_progress_bar(state: RunState) -> Progress:
     current = len(state.iterations)
     task = progress.add_task("Optimization Progress", total=total, completed=current)
     return progress
+
+

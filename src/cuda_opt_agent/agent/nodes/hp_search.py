@@ -1,28 +1,182 @@
+"""
+HP Search 节点 —— LLM 提出多组超参候选, 并发生成+编译+测速。
+
+[优化]:
+  1. LLM 代码生成并发化: asyncio.gather + Semaphore
+  2. 端到端流水线化: 生成→编译→校验→benchmark 各阶段重叠
+  3. 多 GPU 分发: 候选分配到不同 GPU 并行 benchmark
+  4. 编译使用 _compile_hp_candidates_async (基于 as_completed)
+  5. 正确性校验使用 check_correctness_multi_async (跨 shape 并行)
+
+[修复]:
+  6. 添加 HP 编译失败修复循环 (对标 compile_validate 的 _repair_code)
+  7. 添加 correctness 修复循环
+  8. 收集 correctness 失败详情, 传递给 reflect 节点
+  9. 智能代码截断, 保留 main() 校验框架
+  10. 动态温度调节, 连续失败时降低随机性
+  11. 向 LLM 注入近期 correctness 失败历史
+"""
+
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import shutil
 from pathlib import Path
 from typing import Any
 
 from ...codegen.normalizer import extract_cuda_code
-from ...models.data import HyperparamCandidate, NcuMetrics
-from ...tools.correctness import check_correctness_multi, summarize_correctness_results
+from ...models.data import BenchmarkResult, HyperparamCandidate, NcuMetrics
+from ...tools.compile import compile_cuda
+from ...tools.correctness import (
+    check_correctness_multi,
+    check_correctness_multi_async,
+    summarize_correctness_results,
+)
 from ...tools.profile import format_ncu_for_prompt
 from ..temperatures import TEMP_APPLY_METHOD, TEMP_PROPOSE_HP
+from ._helpers import GpuPool, _compile_hp_candidates_async, _iter_compile_hp_candidates_async
 
 logger = logging.getLogger(__name__)
 
 
+# ════════════════════════════════════════
+# [修复] 智能代码截断 —— 保留 main() 校验框架
+# ════════════════════════════════════════
+
+def _smart_truncate_code(code: str, max_chars: int = 8000) -> str:
+    """
+    智能截断: 保留 kernel 函数和 main 函数, 截断中间辅助函数。
+
+    原来的 best_code[:8000] 可能丢失位于末尾的 main() 函数,
+    导致 LLM 看不到 --check / --shape 参数解析和 JSON 输出格式,
+    从而生成格式不兼容的代码。
+    """
+    if len(code) <= max_chars:
+        return code
+
+    # 找到 main 函数的起始位置
+    main_start = -1
+    for marker in ("int main(", "int main ("):
+        pos = code.find(marker)
+        if pos >= 0:
+            main_start = pos
+            break
+
+    if main_start < 0:
+        # 找不到 main, 使用首尾各取一半的策略
+        half = max_chars // 2
+        return (
+            code[:half]
+            + "\n\n// ... [中间代码省略, 请保持原有的 main 函数、"
+            "命令行参数解析和 JSON 输出格式不变] ...\n\n"
+            + code[-half:]
+        )
+
+    # kernel 代码 + main 函数都要保留
+    main_section = code[main_start:]
+    # 为 kernel 部分留出空间
+    remaining_for_kernel = max_chars - len(main_section) - 100
+
+    if remaining_for_kernel > 500:
+        return (
+            code[:remaining_for_kernel]
+            + "\n\n// ... [辅助函数省略] ...\n\n"
+            + main_section
+        )
+    else:
+        # main 太长, 至少保留 kernel 头部 + main 完整
+        kernel_budget = max(500, max_chars // 3)
+        main_budget = max_chars - kernel_budget - 100
+        return (
+            code[:kernel_budget]
+            + "\n\n// ... [中间代码省略] ...\n\n"
+            + main_section[:main_budget]
+            + ("\n// ... [main 函数末尾省略] ..." if len(main_section) > main_budget else "")
+        )
+
+
+# ════════════════════════════════════════
+# [修复] 构建 correctness 失败历史上下文
+# ════════════════════════════════════════
+
+def _build_correctness_failure_history(run_state, limit: int = 5) -> str:
+    """
+    从最近的迭代中提取 correctness 失败的记录,
+    让 LLM 在生成代码时知道之前哪些尝试因为正确性问题失败了。
+    """
+    lines = []
+    for it in reversed(run_state.iterations[-20:]):
+        if not it.correctness_ok and it.method_name:
+            hp_text = json.dumps(it.hyperparams, ensure_ascii=False) if it.hyperparams else "none"
+            lines.append(
+                f"  - {it.version_id} ({it.method_name}, hp={hp_text}): "
+                f"correctness 失败"
+            )
+            if len(lines) >= limit:
+                break
+    if not lines:
+        return "(无近期 correctness 失败记录)"
+    return "\n".join(lines)
+
+
+# ════════════════════════════════════════
+# [修复] 动态温度: 连续失败时降低随机性
+# ════════════════════════════════════════
+
+def _effective_apply_temperature(run_state) -> float:
+    """
+    根据连续 correctness 失败次数动态调整代码生成温度。
+    连续失败越多, 温度越低, 生成更确定性的代码。
+    """
+    consecutive_fails = _count_consecutive_correctness_failures(run_state)
+    if consecutive_fails >= 3:
+        return max(0.05, TEMP_APPLY_METHOD - 0.03 * consecutive_fails)
+    elif consecutive_fails >= 1:
+        return max(0.08, TEMP_APPLY_METHOD - 0.02 * consecutive_fails)
+    return TEMP_APPLY_METHOD
+
+
+def _count_consecutive_correctness_failures(run_state) -> int:
+    """统计尾部连续的 correctness 失败次数。"""
+    count = 0
+    for it in reversed(run_state.iterations):
+        if it.version_id == "v0":
+            break
+        if not it.correctness_ok:
+            count += 1
+        else:
+            break
+    return count
+
+
 async def hp_search_node(self, state: dict) -> dict:
-    """LLM 提出多组超参候选,逐一编译+测速。"""
-    logger.info("=== HP SEARCH ===")
+    """
+    LLM 提出多组超参候选, 并发生成+编译+测速。
+
+    [优化] 核心改动:
+      - Phase 1: 并发 LLM 代码生成 (受 hp_llm_concurrency semaphore 限制)
+      - Phase 2: 异步编译 (基于 as_completed, 先完成先进入下阶段)
+      - Phase 3: 并行正确性校验 (跨 shape 并行)
+      - Phase 4: 多 GPU benchmark
+
+    [修复] 新增:
+      - 编译失败时触发修复循环 (对标 compile_validate._repair_code)
+      - correctness 失败时触发修复循环 (对标 compile_validate._repair_code)
+      - 收集所有候选的 correctness 失败详情
+      - 智能代码截断, 保留 main() 校验框架
+      - 动态温度调节
+      - 注入 correctness 失败历史上下文
+    """
+    logger.info("=== HP SEARCH (optimized + correctness fix) ===")
     decision = state["method_decision"]
     hw = state["hardware_spec"]
     op = state["operator_spec"]
     ncu = state.get("current_ncu", NcuMetrics())
+    run_state = state["run_state"]
 
+    # ── Phase 0: LLM 提出超参候选 ──
     prompt = self.llm.format_prompt(
         "propose_hp.md",
         operator_name=op.name,
@@ -30,7 +184,7 @@ async def hp_search_node(self, state: dict) -> dict:
         method_name=decision.method_name,
         method_rationale=decision.rationale,
         hyperparams_schema=json.dumps(decision.hyperparams_schema or {}, indent=2),
-        known_hp_trials=self._method_history_text(state["run_state"], decision.method_name),
+        known_hp_trials=self._method_history_text(run_state, decision.method_name),
         ncu_key_metrics=format_ncu_for_prompt(ncu)[:3000],
         hardware_summary=self._hardware_summary(hw),
         hp_count=self.sm.config.hp_candidate_count,
@@ -49,40 +203,99 @@ async def hp_search_node(self, state: dict) -> dict:
         if isinstance(item, dict):
             candidates.append(HyperparamCandidate.model_validate(item))
 
+    if not candidates:
+        logger.warning("No HP candidates produced by LLM")
+        return _empty_result()
+
+    version_base = run_state.next_version_id(has_hp=True)
+
+    # [优化] 初始化 GPU 池
+    gpu_pool = GpuPool(self.sm.config.gpu_ids if self.sm.config.gpu_ids else None)
+    logger.info("HP search using %d GPU(s): %s", gpu_pool.count, gpu_pool.gpu_ids)
+
+    # [修复] 智能代码截断, 保留 main() 校验框架
+    best_code = state.get("current_code", "")
+    if self.sm.config.use_code_diff and len(best_code) > 8000:
+        from ._helpers import _build_code_diff_context
+        ctx = _build_code_diff_context(best_code)
+        if ctx["mode"] == "skeleton":
+            # 使用智能截断代替简单的 skeleton
+            code_for_prompt = _smart_truncate_code(best_code, max_chars=8000)
+        else:
+            code_for_prompt = ctx["code"]
+    else:
+        code_for_prompt = best_code
+
+    # [修复] 构建 correctness 失败历史上下文
+    correctness_history = _build_correctness_failure_history(run_state)
+
+    # [修复] 动态温度
+    effective_temp = _effective_apply_temperature(run_state)
+    if effective_temp != TEMP_APPLY_METHOD:
+        logger.info(
+            "Dynamic temperature: %.3f (base=%.3f, consecutive_corr_fails=%d)",
+            effective_temp, TEMP_APPLY_METHOD,
+            _count_consecutive_correctness_failures(run_state),
+        )
+
+    # ── Phase 1: [优化] 并发 LLM 代码生成 ──
+    llm_concurrency = max(1, self.sm.config.hp_llm_concurrency)
+    semaphore = asyncio.Semaphore(llm_concurrency)
+    logger.info("Generating %d candidate codes with concurrency=%d", len(candidates), llm_concurrency)
+
+    async def _generate_code(cand: HyperparamCandidate) -> tuple[HyperparamCandidate, str, Path, Path]:
+        """生成单个候选的代码 (受 semaphore 限制)。"""
+        async with semaphore:
+            version_id = f"{version_base}_cand{cand.index}"
+            iter_dir = self.sm.create_iteration_dir(version_id)
+
+            hp_section = f"- Hyperparams: {json.dumps(cand.hyperparams)}\n- Rationale: {cand.rationale}"
+
+            # [修复] 注入 correctness 失败历史
+            apply_prompt = self.llm.format_prompt(
+                "apply_method.md",
+                operator_name=op.name,
+                operator_context=self._operator_context(op),
+                method_name=decision.method_name,
+                method_rationale=decision.rationale,
+                hyperparams_section=hp_section,
+                hardware_summary=self._hardware_summary(hw),
+                best_id=run_state.current_best_id,
+                best_code=code_for_prompt,
+                ncu_key_metrics=format_ncu_for_prompt(ncu)[:2000],
+                correctness_failure_history=correctness_history,
+            )
+
+            response = await self.llm.ainvoke(
+                apply_prompt,
+                temperature=effective_temp,  # [修复] 使用动态温度
+                node_name=f"hp_search:cand{cand.index}",
+            )
+            code = extract_cuda_code(response)
+            code_path = await asyncio.to_thread(
+                self.sm.persistence.save_code, code, iter_dir
+            )
+            return cand, code, code_path, iter_dir
+
+    # 并发生成所有候选代码
+    gen_tasks = [_generate_code(cand) for cand in candidates]
+    gen_results = await asyncio.gather(*gen_tasks, return_exceptions=True)
+
+    # 收集成功生成的候选
     candidate_records: dict[str, dict[str, Any]] = {}
     compile_jobs: list[dict[str, Any]] = []
-    version_base = state["run_state"].next_version_id(has_hp=True)
 
-    for cand in candidates:
+    for i, result in enumerate(gen_results):
+        if isinstance(result, Exception):
+            logger.warning("Code generation for candidate %d failed: %s", i, result)
+            continue
+        cand, code, code_path, iter_dir = result
         version_id = f"{version_base}_cand{cand.index}"
-        iter_dir = self.sm.create_iteration_dir(version_id)
-
-        hp_section = f"- Hyperparams: {json.dumps(cand.hyperparams)}\n- Rationale: {cand.rationale}"
-
-        apply_prompt = self.llm.format_prompt(
-            "apply_method.md",
-            operator_name=op.name,
-            operator_context=self._operator_context(op),
-            method_name=decision.method_name,
-            method_rationale=decision.rationale,
-            hyperparams_section=hp_section,
-            hardware_summary=self._hardware_summary(hw),
-            best_id=state["run_state"].current_best_id,
-            best_code=state.get("current_code", "")[:8000],
-            ncu_key_metrics=format_ncu_for_prompt(ncu)[:2000],
-        )
-
-        response = await self.llm.ainvoke(
-            apply_prompt,
-            temperature=TEMP_APPLY_METHOD,
-            node_name=f"hp_search:cand{cand.index}",
-        )
-        code = extract_cuda_code(response)
-        code_path = await asyncio.to_thread(self.sm.persistence.save_code, code, iter_dir)
 
         candidate_records[version_id] = {
             "candidate": cand,
             "code": code,
+            "code_path": code_path,
             "iter_dir": iter_dir,
         }
         compile_jobs.append({
@@ -92,57 +305,361 @@ async def hp_search_node(self, state: dict) -> dict:
             "code_path": str(code_path),
             "output_path": str(iter_dir / "kernel"),
             "compute_capability": hw.compute_capability,
+            # [优化] 传递 nvcc_threads 和 gpu_id
+            "nvcc_threads": self.sm.config.nvcc_parallel_threads,
+            "gpu_id": gpu_pool.assign_gpu(cand.index),
         })
 
-    results = []
-    compiled_candidates = await asyncio.to_thread(self._compile_hp_candidates, compile_jobs)
+    if not compile_jobs:
+        logger.warning("All code generation failed")
+        return _empty_result()
 
-    for compiled in compiled_candidates:
+    # ── Phase 2-4: [优化] 编译完成即进入校验+benchmark 流水线 ──
+    worker_count = self._hp_compile_worker_count(len(compile_jobs))
+    dtype = list(op.dtypes.values())[0] if op.dtypes else "fp32"
+    results: list[dict[str, Any]] = []
+    max_correctness_parallel = self.sm.config.correctness_max_parallel
+
+    # [修复] 收集所有候选的 correctness 失败详情
+    correctness_failure_details: list[dict[str, Any]] = []
+
+    # [修复] 获取 correctness 修复次数上限
+    hp_correctness_repair_max = getattr(
+        self.sm.config, "hp_correctness_repair_max", 2
+    )
+
+    async def _validate_and_benchmark(compiled: dict) -> dict[str, Any] | None:
+        """
+        单个候选的校验+benchmark流水线。
+
+        [修复] 当 correctness 失败时, 触发修复循环:
+          1. 收集详细的 correctness 错误信息
+          2. 调用 _repair_code 让 LLM 修复
+          3. 重新编译+校验
+          4. 最多重试 hp_correctness_repair_max 次
+        """
         version_id = compiled["version_id"]
+        if version_id not in candidate_records:
+            return None
+
         record = candidate_records[version_id]
         cand = record["candidate"]
         iter_dir = Path(record["iter_dir"])
+        assigned_gpu = gpu_pool.assign_gpu(cand.index)
 
+        # 写编译日志
         compile_output = (compiled.get("stdout", "") + "\n" + compiled.get("stderr", "")).strip()
-        (iter_dir / "compile.log").write_text(compile_output, encoding="utf-8")
+        await asyncio.to_thread(
+            (iter_dir / "compile.log").write_text, compile_output, encoding="utf-8"
+        )
+
+        current_code = record["code"]
 
         if not compiled.get("success"):
-            logger.warning("Candidate %d compilation failed: %s", cand.index, compiled.get("stderr", "")[:500])
-            continue
-        exe_path = Path(compiled["output_path"])
+            compile_log_entries = [f"[Initial compile]\n{compile_output}"]
+            compile_errors = [
+                f"[HP candidate {cand.index} compile attempt 1]: "
+                f"{compile_output[:2000]}"
+            ]
+            logger.warning("Candidate %d compilation failed: %s",
+                           cand.index, compiled.get("stderr", "")[:500])
 
-        dtype = list(op.dtypes.values())[0] if op.dtypes else "fp32"
-        correctness_results = await asyncio.to_thread(
-            check_correctness_multi,
-            exe_path,
-            self._active_shape_profiles(op),
-            dtype=dtype,
+            exe_path: Path | None = None
+            max_compile_repairs = max(
+                0,
+                getattr(self.sm.config, "compile_repair_max_retries", 0),
+            )
+            for repair_attempt in range(max_compile_repairs):
+                logger.info(
+                    "Attempting compile repair for candidate %d (%d/%d)",
+                    cand.index, repair_attempt + 1, max_compile_repairs,
+                )
+                try:
+                    current_code = await self._repair_code(
+                        current_code, compile_errors, hw
+                    )
+                except Exception as e:
+                    msg = f"Repair code generation failed: {e}"
+                    compile_log_entries.append(
+                        f"[Compile repair {repair_attempt + 1}]\n{msg}"
+                    )
+                    await asyncio.to_thread(
+                        (iter_dir / "compile.log").write_text,
+                        "\n\n".join(compile_log_entries),
+                        encoding="utf-8",
+                    )
+                    logger.warning(
+                        "Compile repair generation failed for candidate %d: %s",
+                        cand.index, e,
+                    )
+                    break
+
+                repair_code_path = await asyncio.to_thread(
+                    self.sm.persistence.save_code,
+                    current_code,
+                    iter_dir,
+                    f"code_compile_fix{repair_attempt + 1}.cu",
+                )
+                try:
+                    repair_cr = await asyncio.to_thread(
+                        compile_cuda,
+                        repair_code_path,
+                        iter_dir / f"kernel_compile_fix{repair_attempt + 1}",
+                        hw.compute_capability,
+                        nvcc_threads=self.sm.config.nvcc_parallel_threads,
+                    )
+                except TypeError as e:
+                    if "unexpected keyword" not in str(e):
+                        raise
+                    repair_cr = await asyncio.to_thread(
+                        compile_cuda,
+                        repair_code_path,
+                        iter_dir / f"kernel_compile_fix{repair_attempt + 1}",
+                        hw.compute_capability,
+                    )
+
+                repair_output = (repair_cr.stdout + "\n" + repair_cr.stderr).strip()
+                compile_log_entries.append(
+                    f"[Compile repair {repair_attempt + 1}]\n{repair_output}"
+                )
+                await asyncio.to_thread(
+                    (iter_dir / "compile.log").write_text,
+                    "\n\n".join(compile_log_entries),
+                    encoding="utf-8",
+                )
+
+                if repair_cr.success:
+                    exe_path = Path(repair_cr.output_path)
+                    record["code"] = current_code
+                    logger.info(
+                        "Candidate %d compilation PASSED after %d repair(s)",
+                        cand.index, repair_attempt + 1,
+                    )
+                    break
+
+                compile_errors.append(
+                    f"[HP candidate {cand.index} compile repair "
+                    f"{repair_attempt + 1} failed]: {repair_output[:2000]}"
+                )
+
+            if exe_path is None:
+                return None
+        else:
+            exe_path = Path(compiled["output_path"])
+
+        # ── [修复] correctness 修复循环 ──
+        accumulated_errors: list[str] = []
+
+        for repair_attempt in range(hp_correctness_repair_max + 1):
+            # [优化] 跨 shape 并行正确性校验
+            shape_profiles = self._active_shape_profiles(op)
+            if len(shape_profiles) <= 1 or max_correctness_parallel <= 1:
+                try:
+                    correctness_results = await asyncio.to_thread(
+                        check_correctness_multi,
+                        exe_path,
+                        shape_profiles,
+                        dtype=dtype,
+                        gpu_id=assigned_gpu,
+                    )
+                except TypeError as e:
+                    if "unexpected keyword" not in str(e):
+                        raise
+                    correctness_results = await asyncio.to_thread(
+                        check_correctness_multi,
+                        exe_path,
+                        shape_profiles,
+                        dtype=dtype,
+                    )
+            else:
+                correctness_results = await check_correctness_multi_async(
+                    exe_path,
+                    shape_profiles,
+                    dtype=dtype,
+                    gpu_id=assigned_gpu,
+                    max_parallel=max_correctness_parallel,
+                )
+
+            # ── 校验通过, 跳出修复循环 ──
+            if all(r.get("correct") for r in correctness_results):
+                if repair_attempt > 0:
+                    logger.info(
+                        "Candidate %d correctness PASSED after %d repair(s)",
+                        cand.index, repair_attempt,
+                    )
+                break
+
+            # ── [修复] 收集详细的 correctness 错误信息 ──
+            error_details = []
+            for r in correctness_results:
+                if not r.get("correct"):
+                    error_details.append(
+                        f"shape={r.get('shape_label', '?')}: "
+                        f"max_abs_error={r.get('max_abs_error', '?')}, "
+                        f"max_rel_error={r.get('max_rel_error', '?')}, "
+                        f"atol={r.get('atol_used', '?')}, rtol={r.get('rtol_used', '?')}, "
+                        f"msg={r.get('message', '?')}"
+                    )
+            error_summary = "; ".join(error_details)
+            accumulated_errors.append(
+                f"[Correctness repair attempt {repair_attempt + 1}]: {error_summary}"
+            )
+
+            logger.warning(
+                "Candidate %d correctness failed (attempt %d/%d): %s",
+                cand.index, repair_attempt + 1, hp_correctness_repair_max + 1,
+                error_summary[:300],
+            )
+
+            # ── 如果还有修复次数, 尝试修复 ──
+            if repair_attempt < hp_correctness_repair_max:
+                logger.info(
+                    "Attempting correctness repair for candidate %d (%d/%d)",
+                    cand.index, repair_attempt + 1, hp_correctness_repair_max,
+                )
+                try:
+                    current_code = await self._repair_code(
+                        current_code, accumulated_errors, hw
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Repair code generation failed for candidate %d: %s",
+                        cand.index, e,
+                    )
+                    break
+
+                # 保存修复后的代码
+                fix_filename = f"code_fix{repair_attempt + 1}.cu"
+                new_code_path = await asyncio.to_thread(
+                    self.sm.persistence.save_code,
+                    current_code,
+                    iter_dir,
+                    fix_filename,
+                )
+
+                # 重新编译
+                try:
+                    new_cr = await asyncio.to_thread(
+                        compile_cuda,
+                        new_code_path,
+                        iter_dir / f"kernel_fix{repair_attempt + 1}",
+                        hw.compute_capability,
+                        nvcc_threads=self.sm.config.nvcc_parallel_threads,
+                    )
+                except TypeError as e:
+                    if "unexpected keyword" not in str(e):
+                        raise
+                    new_cr = await asyncio.to_thread(
+                        compile_cuda,
+                        new_code_path,
+                        iter_dir / f"kernel_fix{repair_attempt + 1}",
+                        hw.compute_capability,
+                    )
+
+                if not new_cr.success:
+                    logger.warning(
+                        "Repair recompilation failed for candidate %d: %s",
+                        cand.index, new_cr.stderr[:300],
+                    )
+                    accumulated_errors.append(
+                        f"[Compile after repair {repair_attempt + 1}]: {new_cr.stderr[:500]}"
+                    )
+                    # 编译失败继续下一轮修复尝试 (而不是直接放弃)
+                    continue
+
+                exe_path = Path(new_cr.output_path)
+                record["code"] = current_code  # 更新为修复后的代码
+            else:
+                # 修复次数用尽, 收集失败详情
+                correctness_failure_details.append({
+                    "candidate_index": cand.index,
+                    "hyperparams": cand.hyperparams,
+                    "errors": [
+                        {
+                            "shape": r.get("shape_label", "?"),
+                            "max_abs_error": r.get("max_abs_error"),
+                            "max_rel_error": r.get("max_rel_error"),
+                            "message": r.get("message", ""),
+                        }
+                        for r in correctness_results if not r.get("correct")
+                    ],
+                    "repair_attempts": hp_correctness_repair_max,
+                    "accumulated_errors": accumulated_errors,
+                })
+                logger.warning(
+                    "Candidate %d correctness failed after %d repair attempts",
+                    cand.index, hp_correctness_repair_max,
+                )
+                return None
+        else:
+            # for-else: 如果没有 break (即最后一轮修复后校验仍然失败)
+            # 这种情况在 break 分支外已处理, 这里是安全兜底
+            correctness_failure_details.append({
+                "candidate_index": cand.index,
+                "hyperparams": cand.hyperparams,
+                "errors": [],
+                "repair_attempts": hp_correctness_repair_max,
+                "accumulated_errors": accumulated_errors,
+            })
+            return None
+
+        # 如果候选经历过编译或 correctness 修复, 将最终可执行文件和代码落回
+        # 标准路径。后续 profile_best 只会读取 iter*/kernel 和 iter*/code.cu。
+        await asyncio.to_thread(
+            self.sm.persistence.save_code,
+            current_code,
+            iter_dir,
         )
-        if not all(r.get("correct") for r in correctness_results):
-            logger.warning("Candidate %d correctness check failed: %s", cand.index, summarize_correctness_results(correctness_results))
-            continue
+        canonical_exe = iter_dir / "kernel"
+        if exe_path.resolve() != canonical_exe.resolve():
+            await asyncio.to_thread(shutil.copy2, exe_path, canonical_exe)
+        exe_path = canonical_exe
 
-        bm = await asyncio.to_thread(self._benchmark_multi, exe_path, op)
-        results.append({
+        # [优化] 多 GPU benchmark (通过 GPU semaphore 避免竞争)
+        gpu_sem = gpu_pool.get_semaphore(assigned_gpu)
+        async with gpu_sem:
+            try:
+                bm = await asyncio.to_thread(
+                    self._benchmark_multi, exe_path, op, assigned_gpu
+                )
+            except TypeError as e:
+                if "positional" not in str(e) and "argument" not in str(e):
+                    raise
+                bm = await asyncio.to_thread(self._benchmark_multi, exe_path, op)
+
+        return {
             "index": cand.index,
             "version_id": version_id,
             "hyperparams": cand.hyperparams,
             "benchmark": bm,
             "code": record["code"],
             "iter_dir": str(iter_dir),
-        })
+        }
+
+    validate_tasks: list[asyncio.Task] = []
+    if worker_count <= 1:
+        compiled_candidates = await _compile_hp_candidates_async(compile_jobs, worker_count)
+        for compiled in compiled_candidates:
+            r = await _validate_and_benchmark(compiled)
+            if r is not None:
+                results.append(r)
+    else:
+        async for compiled in _iter_compile_hp_candidates_async(compile_jobs, worker_count):
+            validate_tasks.append(asyncio.create_task(_validate_and_benchmark(compiled)))
+
+    if validate_tasks:
+        for task in asyncio.as_completed(validate_tasks):
+            try:
+                r = await task
+            except Exception as e:
+                logger.warning("Validate/benchmark pipeline error: %s", e)
+                continue
+            if r is not None:
+                results.append(r)
 
     if not results:
-        return {
-            "new_code": "",
-            "new_version_id": "",
-            "trial_version_id": "",
-            "trial_benchmark": None,
-            "trial_compile_ok": False,
-            "trial_correctness_ok": False,
-            "trial_accepted": False,
-            "hp_candidates": [],
-        }
+        # [修复] 返回包含 correctness 失败详情的结果
+        return _empty_result_with_details(correctness_failure_details)
 
     best_cand = min(results, key=lambda r: r["benchmark"].latency_ms_median)
 
@@ -154,4 +671,49 @@ async def hp_search_node(self, state: dict) -> dict:
         "trial_compile_ok": True,
         "trial_correctness_ok": True,
         "hp_candidates": results,
+        # [修复] 即使部分成功, 也传递失败详情供 reflect 分析
+        "hp_correctness_failures": correctness_failure_details,
+        "hp_all_compiled_ok": True,
+    }
+
+
+def _empty_result() -> dict:
+    """返回空结果 (所有候选失败时使用, 向后兼容)。"""
+    return {
+        "new_code": "",
+        "new_version_id": "",
+        "trial_version_id": "",
+        "trial_benchmark": None,
+        "trial_compile_ok": False,
+        "trial_correctness_ok": False,
+        "trial_accepted": False,
+        "hp_candidates": [],
+        "hp_correctness_failures": [],
+        "hp_all_compiled_ok": False,
+    }
+
+
+def _empty_result_with_details(
+    correctness_failures: list[dict[str, Any]] | None = None,
+) -> dict:
+    """
+    [修复] 返回包含 correctness 失败详情的空结果。
+
+    关键区别:
+      - hp_all_compiled_ok=True 表示编译成功但 correctness 失败
+      - hp_correctness_failures 包含每个候选的详细错误信息
+    """
+    has_compiled_candidates = bool(correctness_failures)
+    return {
+        "new_code": "",
+        "new_version_id": "",
+        "trial_version_id": "",
+        "trial_benchmark": None,
+        "trial_compile_ok": False,
+        "trial_correctness_ok": False,
+        "trial_accepted": False,
+        "hp_candidates": [],
+        # [修复] 传递 correctness 失败详情
+        "hp_correctness_failures": correctness_failures or [],
+        "hp_all_compiled_ok": has_compiled_candidates,
     }

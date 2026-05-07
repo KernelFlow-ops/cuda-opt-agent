@@ -14,3 +14,5 @@ async def init_node(self, state: dict) -> dict:
     hw = await asyncio.to_thread(collect_hardware_info)
     logger.info("GPU: %s (%s), CUDA: %s", hw.gpu_name, hw.compute_capability, hw.cuda_version)
     return {"hardware_spec": hw}
+
+

@@ -1,5 +1,9 @@
 """
 nvcc 编译工具 —— 编译 .cu 文件并返回结果。
+
+[优化]:
+  - 支持 -t N 多线程编译 (nvcc_threads 参数)
+  - 支持 gpu_id 指定 CUDA_VISIBLE_DEVICES
 """
 
 from __future__ import annotations
@@ -34,15 +38,28 @@ class CompileResult:
     return_code: int = -1
 
 
+def _auto_nvcc_threads() -> int:
+    """[优化] 自动确定 nvcc 并行线程数。"""
+    cpu = os.cpu_count() or 1
+    # nvcc -t 的合理上限, 避免在大核心机器上过度竞争
+    return min(cpu, 8)
+
+
 def compile_cuda(
     source_path: str | Path,
     output_path: str | Path | None = None,
     compute_capability: str = "sm_80",
     extra_flags: list[str] | None = None,
     timeout: int = 120,
+    nvcc_threads: int = 0,
+    gpu_id: int | None = None,
 ) -> CompileResult:
     """
     使用 nvcc 编译 CUDA 源文件。
+
+    [优化]:
+      - nvcc_threads: 0=auto, 1=禁用, >1=指定线程数 (nvcc -t N)
+      - gpu_id: 指定 CUDA_VISIBLE_DEVICES, 用于多 GPU 场景
 
     Args:
         source_path: .cu 源文件路径
@@ -50,6 +67,8 @@ def compile_cuda(
         compute_capability: GPU 架构, 如 "sm_80"
         extra_flags: 额外的 nvcc 编译参数
         timeout: 编译超时秒数
+        nvcc_threads: nvcc 并行线程数
+        gpu_id: 目标 GPU 索引
 
     Returns:
         CompileResult
@@ -80,10 +99,23 @@ def compile_cuda(
         "-lineinfo",
     ]
 
+    # [优化] 添加 -t N 多线程编译
+    effective_threads = nvcc_threads
+    if effective_threads == 0:
+        effective_threads = _auto_nvcc_threads()
+    if effective_threads > 1:
+        cmd.extend(["-t", str(effective_threads)])
+
     if extra_flags:
         cmd.extend(extra_flags)
 
     logger.info("Compile command: %s", " ".join(cmd))
+
+    # [优化] 设置 CUDA_VISIBLE_DEVICES 用于多 GPU 编译
+    env = None
+    if gpu_id is not None:
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
     try:
         result = subprocess.run(
@@ -93,6 +125,7 @@ def compile_cuda(
             errors="replace",
             timeout=timeout,
             cwd=str(source_path.parent),
+            env=env,
         )
         actual_output_path = _actual_output_path(output_path)
         return CompileResult(
@@ -114,10 +147,13 @@ def compile_with_benchmark_harness(
     output_path: str | Path,
     compute_capability: str = "sm_80",
     timeout: int = 120,
+    nvcc_threads: int = 0,
+    gpu_id: int | None = None,
 ) -> CompileResult:
     """
     编译 kernel + benchmark harness。
-    harness 包含 main() 函数,负责分配内存、调用 kernel、计时。
+
+    [优化] 支持 nvcc_threads 和 gpu_id
     """
     kernel_path = Path(kernel_source).resolve()
     harness_path = Path(harness_source).resolve()
@@ -140,9 +176,20 @@ def compile_with_benchmark_harness(
         f"-I{kernel_path.parent}",
     ]
 
+    # [优化] 添加 -t N
+    effective_threads = nvcc_threads if nvcc_threads > 0 else _auto_nvcc_threads()
+    if effective_threads > 1:
+        cmd.extend(["-t", str(effective_threads)])
+
+    env = None
+    if gpu_id is not None:
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, errors="replace", timeout=timeout,
+            cmd, capture_output=True, text=True, errors="replace",
+            timeout=timeout, env=env,
         )
         actual_output_path = _actual_output_path(output_path)
         return CompileResult(
@@ -156,3 +203,5 @@ def compile_with_benchmark_harness(
         return CompileResult(success=False, stderr=f"Compilation timed out ({timeout}s)")
     except Exception as e:
         return CompileResult(success=False, stderr=f"Compilation error: {e}")
+
+

@@ -1,5 +1,9 @@
 """
-RunState 管理器 —— 高层封装,整合持久化与状态操作。
+RunStateManager —— 封装 RunState 的创建、修改、续跑逻辑。
+
+[修复]:
+  - should_stop 区分 correctness 失败和性能不够
+  - 连续 correctness 失败时给出更有信息量的终止原因
 """
 
 from __future__ import annotations
@@ -121,6 +125,10 @@ class RunStateManager:
         """
         检查是否满足终止条件。
 
+        [修复] 区分 correctness 失败和性能不够:
+          - 连续 correctness 失败使用独立的计数和更有信息量的终止原因
+          - 连续 correctness 失败的阈值比一般 reject 更宽容 (给修复机制更多机会)
+
         Returns:
             (should_stop, reason)
         """
@@ -132,10 +140,34 @@ class RunStateManager:
         if len(s.iterations) >= c.max_iterations:
             return True, f"Reached maximum iterations ({c.max_iterations})"
 
-        # 2) 连续回退
+        # 2) [修复] 区分 correctness 失败和一般的 reject
         rejects = s.consecutive_rejects()
+
+        # 检查连续 correctness 失败
+        corr_fails = s.consecutive_correctness_failures()
+
+        if corr_fails >= c.consecutive_reject_limit:
+            # 连续 correctness 失败: 可能是系统性的代码生成问题
+            return True, (
+                f"Correctness failed {corr_fails} times consecutively. "
+                f"This indicates a systematic issue with code generation "
+                f"(e.g. incorrect algorithm logic, broken validation framework, "
+                f"or data type mismatch). Consider checking the v0 baseline "
+                f"correctness and the operator specification."
+            )
+
         if rejects >= c.consecutive_reject_limit:
-            return True, f"Rejected {rejects} times consecutively; likely stuck in a local optimum"
+            # 如果大部分是 correctness 失败, 给出不同的提示
+            if corr_fails > rejects // 2:
+                return True, (
+                    f"Rejected {rejects} times consecutively "
+                    f"({corr_fails} due to correctness failures). "
+                    f"The optimization approach may be introducing numerical errors."
+                )
+            return True, (
+                f"Rejected {rejects} times consecutively; "
+                f"likely stuck in a local optimum"
+            )
 
         return False, ""
 

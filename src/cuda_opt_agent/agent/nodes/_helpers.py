@@ -1,5 +1,17 @@
+"""
+节点辅助函数。
+
+[优化]:
+  - _compile_hp_candidate_job: 支持 gpu_id 和 nvcc_threads
+  - _compile_hp_candidates_async: 基于 asyncio + as_completed 的异步编译
+  - _generate_code_diff / _build_code_diff_context: 代码 diff 工具
+  - GpuPool: 多 GPU 资源池
+"""
+
 from __future__ import annotations
 
+import asyncio
+import difflib
 import json
 import logging
 import os
@@ -16,8 +28,60 @@ from ...tools.compile import compile_cuda
 logger = logging.getLogger(__name__)
 
 
+# ════════════════════════════════════════
+# [优化] 多 GPU 资源池
+# ════════════════════════════════════════
+class GpuPool:
+    """简易 GPU 资源池, 用于 hp 候选多 GPU 分发。"""
+
+    def __init__(self, gpu_ids: list[int] | None = None):
+        if gpu_ids:
+            self._ids = list(gpu_ids)
+        else:
+            # 自动检测
+            self._ids = self._detect_gpus()
+        self._semaphores: dict[int, asyncio.Semaphore] = {}
+
+    def _detect_gpus(self) -> list[int]:
+        """检测可用 GPU 数量。"""
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            count = pynvml.nvmlDeviceGetCount()
+            pynvml.nvmlShutdown()
+            return list(range(count)) or [0]
+        except Exception:
+            return [0]
+
+    @property
+    def gpu_ids(self) -> list[int]:
+        return self._ids
+
+    @property
+    def count(self) -> int:
+        return len(self._ids)
+
+    def get_semaphore(self, gpu_id: int) -> asyncio.Semaphore:
+        """每个 GPU 一个 semaphore, 防止同时跑多个 benchmark。"""
+        if gpu_id not in self._semaphores:
+            self._semaphores[gpu_id] = asyncio.Semaphore(1)
+        return self._semaphores[gpu_id]
+
+    def assign_gpu(self, index: int) -> int:
+        """根据候选索引分配 GPU (round-robin)。"""
+        return self._ids[index % len(self._ids)]
+
+
+# ════════════════════════════════════════
+# HP 候选编译 (原始 + 优化)
+# ════════════════════════════════════════
+
 def _compile_hp_candidate_job(job: dict[str, Any]) -> dict[str, Any]:
-    """Compile one HP candidate in a worker process."""
+    """
+    Compile one HP candidate in a worker process.
+
+    [优化] 支持 gpu_id 和 nvcc_threads 参数。
+    """
     result = {
         "index": job["index"],
         "version_id": job["version_id"],
@@ -30,11 +94,18 @@ def _compile_hp_candidate_job(job: dict[str, Any]) -> dict[str, Any]:
         "return_code": -1,
     }
     try:
-        cr = compile_cuda(
-            job["code_path"],
-            job["output_path"],
-            job["compute_capability"],
-        )
+        try:
+            cr = compile_cuda(
+                job["code_path"],
+                job["output_path"],
+                job["compute_capability"],
+                nvcc_threads=job.get("nvcc_threads", 0),
+                gpu_id=job.get("gpu_id"),
+            )
+        except TypeError as e:
+            if "unexpected keyword" not in str(e):
+                raise
+            cr = compile_cuda(job["code_path"], job["output_path"], job["compute_capability"])
         result.update({
             "success": cr.success,
             "output_path": cr.output_path,
@@ -46,6 +117,71 @@ def _compile_hp_candidate_job(job: dict[str, Any]) -> dict[str, Any]:
         result["stderr"] = f"Compilation worker error: {e}"
     return result
 
+
+async def _compile_hp_candidates_async(
+    jobs: list[dict[str, Any]],
+    worker_count: int,
+) -> list[dict[str, Any]]:
+    """
+    [优化] 基于 asyncio + ProcessPoolExecutor 的异步编译。
+
+    使用 run_in_executor 逐个提交, 结果按完成顺序收集。
+    """
+    return [result async for result in _iter_compile_hp_candidates_async(jobs, worker_count)]
+
+
+async def _iter_compile_hp_candidates_async(
+    jobs: list[dict[str, Any]],
+    worker_count: int,
+):
+    """Yield HP candidate compile results as soon as each job finishes."""
+    if not jobs:
+        return
+
+    if worker_count <= 1:
+        for job in jobs:
+            yield await asyncio.to_thread(_compile_hp_candidate_job, job)
+        return
+
+    loop = asyncio.get_running_loop()
+    completed: set[int] = set()
+
+    async def _run_job(executor: ProcessPoolExecutor, job: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return await loop.run_in_executor(executor, _compile_hp_candidate_job, job)
+        except Exception as e:
+            return {
+                "index": job["index"],
+                "version_id": job.get("version_id", ""),
+                "iter_dir": job.get("iter_dir", ""),
+                "code_path": job.get("code_path", ""),
+                "success": False,
+                "output_path": "",
+                "stdout": "",
+                "stderr": f"async compile error: {e}",
+                "return_code": -1,
+            }
+
+    try:
+        with ProcessPoolExecutor(max_workers=worker_count) as executor:
+            tasks = [_run_job(executor, job) for job in jobs]
+            for coro in asyncio.as_completed(tasks):
+                result = await coro
+                completed.add(result["index"])
+                status = "OK" if result["success"] else "FAIL"
+                logger.info("Compiled candidate %d: %s", result["index"], status)
+                yield result
+    except Exception as e:
+        logger.warning("Parallel HP compilation failed; falling back to serial: %s", e)
+        for job in jobs:
+            if job["index"] in completed:
+                continue
+            yield await asyncio.to_thread(_compile_hp_candidate_job, job)
+
+
+# ════════════════════════════════════════
+# 原有辅助函数 (保持不变 + 小优化)
+# ════════════════════════════════════════
 
 def _operator_context(op) -> str:
     """Format task semantics once so every optimization prompt sees the same context."""
@@ -81,23 +217,25 @@ def _active_shape_profiles(op) -> list[dict]:
     return [{}]
 
 
-def _benchmark_multi(self, exe_path: Path, op) -> BenchmarkResult:
+def _benchmark_multi(self, exe_path: Path, op, gpu_id: int | None = None) -> BenchmarkResult:
+    """[优化] 支持 gpu_id 参数。"""
     return run_benchmark_multi(
         exe_path,
         self._active_shape_profiles(op),
         warmup_rounds=self.sm.config.benchmark_warmup_rounds,
         measure_rounds=self.sm.config.benchmark_measure_rounds,
         aggregator=self.sm.config.multi_shape_aggregator,
+        gpu_id=gpu_id,
     )
 
 
 def _profile_args_from_benchmark(self, bm: BenchmarkResult) -> list[str]:
     shape = bm.extra.get("worst_shape") if bm and bm.extra else None
     args = shape_profile_to_args(shape or {})
-    args.extend([
-        "--warmup", str(self.sm.config.ncu_warmup_rounds),
-        "--rounds", str(self.sm.config.ncu_profile_rounds),
-    ])
+    measure_flag = "--iters" if bm and bm.extra.get("benchmark_arg_style") in {"iters", "iters_benchmark"} else "--rounds"
+    if bm and bm.extra.get("benchmark_arg_style") == "iters_benchmark":
+        args.insert(0, "--benchmark")
+    args.extend(["--warmup", str(self.sm.config.ncu_warmup_rounds), measure_flag, str(self.sm.config.ncu_profile_rounds)])
     return args
 
 
@@ -175,6 +313,7 @@ def _hp_compile_worker_count(self, job_count: int) -> int:
 
 
 def _compile_hp_candidates(self, jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """原始串行/ProcessPoolExecutor 方式 (向后兼容, 仍可使用)。"""
     worker_count = self._hp_compile_worker_count(len(jobs))
     if worker_count <= 1:
         return [_compile_hp_candidate_job(job) for job in jobs]
@@ -208,6 +347,105 @@ def _kernel_executable(iter_dir: Path) -> Path:
     if win_exe_path.exists():
         return win_exe_path
     return exe_path
+
+
+# ════════════════════════════════════════
+# [优化] 代码 diff 工具
+# ════════════════════════════════════════
+
+def _generate_code_diff(old_code: str, new_code: str, context_lines: int = 5) -> str:
+    """
+    [优化] 生成 unified diff 格式的代码差异。
+
+    Args:
+        old_code: 旧版本代码
+        new_code: 新版本代码
+        context_lines: diff 上下文行数
+
+    Returns:
+        unified diff 字符串
+    """
+    old_lines = old_code.splitlines(keepends=True)
+    new_lines = new_code.splitlines(keepends=True)
+    diff = difflib.unified_diff(
+        old_lines, new_lines,
+        fromfile="best.cu", tofile="new.cu",
+        n=context_lines,
+    )
+    return "".join(diff)
+
+
+def _build_code_diff_context(
+    best_code: str,
+    max_skeleton_chars: int = 3000,
+    max_full_chars: int = 8000,
+) -> dict[str, str]:
+    """
+    [优化] 为 apply/analyze 节点构建代码上下文, 用 diff 模式。
+
+    当代码较短时直接发送完整代码;
+    当代码较长时发送代码骨架 (函数签名、kernel launch config 等)。
+
+    Returns:
+        {"mode": "full"|"skeleton", "code": ..., "skeleton": ...}
+    """
+    if len(best_code) <= max_full_chars:
+        return {
+            "mode": "full",
+            "code": best_code,
+            "skeleton": "",
+        }
+
+    # 提取骨架: kernel 函数签名、launch config、shared mem 声明
+    import re
+    skeleton_lines = []
+    lines = best_code.split("\n")
+    in_kernel = False
+    brace_depth = 0
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+
+        # 保留 #include 和 #define
+        if stripped.startswith("#include") or stripped.startswith("#define"):
+            skeleton_lines.append(line)
+            continue
+
+        # 保留 __global__ / __device__ 函数签名
+        if "__global__" in stripped or "__device__" in stripped:
+            skeleton_lines.append(line)
+            in_kernel = True
+            continue
+
+        # 保留 __shared__ 声明
+        if "__shared__" in stripped:
+            skeleton_lines.append(line)
+            continue
+
+        # 保留 kernel launch <<<...>>>
+        if "<<<" in stripped and ">>>" in stripped:
+            skeleton_lines.append(line)
+            continue
+
+        # 保留 main 函数签名
+        if re.match(r"\s*(int|void)\s+main\s*\(", stripped):
+            skeleton_lines.append(line)
+            continue
+
+        # 保留 cudaMalloc / cudaMemcpy
+        if any(kw in stripped for kw in ["cudaMalloc", "cudaMemcpy", "cudaFree"]):
+            skeleton_lines.append(line)
+            continue
+
+    skeleton = "\n".join(skeleton_lines)
+    if len(skeleton) > max_skeleton_chars:
+        skeleton = skeleton[:max_skeleton_chars] + "\n// ... skeleton truncated ..."
+
+    return {
+        "mode": "skeleton",
+        "code": best_code[:max_full_chars] + "\n/* ... code truncated ... */",
+        "skeleton": skeleton,
+    }
 
 
 def _generate_final_report(self, run_state) -> str:
@@ -250,3 +488,5 @@ def _generate_final_report(self, run_state) -> str:
         lines.append(f"| {it.version_id} | {it.method_name or 'baseline'} | {lat} | {per_shape} | {status} |")
 
     return "\n".join(lines)
+
+

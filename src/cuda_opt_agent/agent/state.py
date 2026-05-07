@@ -1,5 +1,9 @@
 """
 LangGraph 状态定义 —— 节点间通过 GraphState 通信。
+
+[修复] 新增字段:
+  - hp_correctness_failures: HP 候选的 correctness 失败详情
+  - hp_all_compiled_ok: 区分编译失败 vs correctness 失败
 """
 
 from __future__ import annotations
@@ -45,6 +49,10 @@ class GraphState(TypedDict, total=False):
     trial_accepted: bool
     trial_compile_ok: bool
     trial_correctness_ok: bool
+
+    # ── [修复] HP correctness 失败详情 ──
+    hp_correctness_failures: list[dict[str, Any]]
+    hp_all_compiled_ok: bool
 
     # ── 反思 ──
     reflection: dict

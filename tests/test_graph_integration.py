@@ -5,11 +5,13 @@
 
 import asyncio
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from cuda_opt_agent.agent.state import GraphState
+from cuda_opt_agent.agent.temperatures import TEMP_APPLY_METHOD, TEMP_PROPOSE_HP
 from cuda_opt_agent.models.data import (
     AgentConfig,
     BlacklistEntry,
@@ -513,12 +515,175 @@ int main() { return 0; }
         assert event_types == ["compile", "compile", "check", "bench", "check", "bench"]
         assert result["trial_benchmark"].latency_ms_median == 1.0
         assert result["new_version_id"].endswith("cand1")
-        assert llm.ainvoke_json.call_args.kwargs["temperature"] == 0.8
-        assert [call.kwargs["temperature"] for call in llm.ainvoke.call_args_list] == [0.25, 0.25]
+        assert llm.ainvoke_json.call_args.kwargs["temperature"] == TEMP_PROPOSE_HP
+        assert [call.kwargs["temperature"] for call in llm.ainvoke.call_args_list] == [
+            TEMP_APPLY_METHOD,
+            TEMP_APPLY_METHOD,
+        ]
         assert [call.kwargs["node_name"] for call in llm.ainvoke.call_args_list] == [
             "hp_search:cand0",
             "hp_search:cand1",
         ]
+
+    def test_hp_search_repairs_compile_failed_candidate(self, sample_agent_config,
+                                                              sample_operator_spec,
+                                                              sample_hardware_spec,
+                                                              sample_run_state):
+        config = sample_agent_config.model_copy(update={
+            "hp_compile_workers": 1,
+            "compile_repair_max_retries": 1,
+        })
+        nodes, sm, llm = self._make_nodes(config)
+        sm.state = sample_run_state
+        sm.run_dir = sm.persistence.create_run_dir("test")
+
+        llm.format_prompt.return_value = "prompt"
+        llm.ainvoke_json.return_value = [
+            {"index": 0, "hyperparams": {"tile": 64}, "rationale": "safe"},
+        ]
+        llm.ainvoke.side_effect = [
+            "```cuda\n__global__ void broken() {}\n```",
+            "```cuda\n__global__ void repaired() {}\n```",
+        ]
+        events = []
+
+        from cuda_opt_agent.tools.compile import CompileResult
+
+        def fake_initial_compile(code_path, output_path, compute_capability):
+            events.append(("initial_compile", Path(code_path).name))
+            return CompileResult(
+                success=False,
+                output_path=str(output_path),
+                stdout="",
+                stderr="bad generated code",
+                return_code=1,
+            )
+
+        def fake_repair_compile(code_path, output_path, compute_capability, **kwargs):
+            events.append(("repair_compile", Path(code_path).name))
+            output_path = Path(output_path)
+            output_path.write_text("kernel", encoding="utf-8")
+            return CompileResult(
+                success=True,
+                output_path=str(output_path),
+                stdout="ok",
+                stderr="",
+                return_code=0,
+            )
+
+        def fake_correctness(exe_path, shape_profiles, dtype, gpu_id=None):
+            events.append(("check", Path(exe_path).name))
+            return [{"correct": True, "message": "ok"}]
+
+        def fake_benchmark(exe_path, op, gpu_id=None):
+            events.append(("bench", Path(exe_path).name))
+            return BenchmarkResult(latency_ms_median=1.0, latency_ms_p95=1.1)
+
+        state: GraphState = {
+            "operator_spec": sample_operator_spec,
+            "hardware_spec": sample_hardware_spec,
+            "run_state": sample_run_state,
+            "current_ncu": NcuMetrics(),
+            "current_code": "__global__ void base() {}",
+            "method_decision": MethodDecision(
+                method_name="tiling",
+                has_hyperparams=True,
+                hyperparams_schema={"tile": {"type": "int"}},
+            ),
+        }
+
+        with patch("cuda_opt_agent.agent.nodes._helpers.compile_cuda", side_effect=fake_initial_compile), \
+             patch("cuda_opt_agent.agent.nodes.hp_search.compile_cuda", side_effect=fake_repair_compile), \
+             patch("cuda_opt_agent.agent.nodes.hp_search.check_correctness_multi", side_effect=fake_correctness), \
+             patch.object(nodes, "_benchmark_multi", side_effect=fake_benchmark):
+            result = run_async(nodes.hp_search_node(state))
+
+        assert [event[0] for event in events] == [
+            "initial_compile",
+            "repair_compile",
+            "check",
+            "bench",
+        ]
+        assert result["trial_compile_ok"] is True
+        assert result["trial_correctness_ok"] is True
+        assert "repaired" in result["new_code"]
+
+        iter_dir = sm.run_dir / f"iter{result['new_version_id']}"
+        assert "repaired" in (iter_dir / "code.cu").read_text(encoding="utf-8")
+        assert (iter_dir / "kernel").exists()
+        assert "bad generated code" in (iter_dir / "compile.log").read_text(encoding="utf-8")
+
+    def test_hp_search_handles_absolute_output_path_for_canonical_kernel(
+        self,
+        sample_agent_config,
+        sample_operator_spec,
+        sample_hardware_spec,
+        sample_run_state,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.chdir(tmp_path)
+        config = sample_agent_config.model_copy(update={
+            "runs_dir": "runs",
+            "knowledge_base_dir": "kb",
+            "hp_compile_workers": 1,
+        })
+        nodes, sm, llm = self._make_nodes(config)
+        sm.state = sample_run_state
+        sm.run_dir = sm.persistence.create_run_dir("test")
+
+        llm.format_prompt.return_value = "prompt"
+        llm.ainvoke_json.return_value = [
+            {"index": 0, "hyperparams": {"tile": 64}, "rationale": "safe"},
+        ]
+        llm.ainvoke.return_value = "```cuda\n__global__ void k() {}\n```"
+        events = []
+
+        from cuda_opt_agent.tools.compile import CompileResult
+
+        def fake_compile(code_path, output_path, compute_capability):
+            events.append(("compile", str(output_path)))
+            abs_output_path = Path(output_path).resolve()
+            abs_output_path.parent.mkdir(parents=True, exist_ok=True)
+            abs_output_path.write_text("kernel", encoding="utf-8")
+            return CompileResult(
+                success=True,
+                output_path=str(abs_output_path),
+                stdout="ok",
+                stderr="",
+                return_code=0,
+            )
+
+        def fake_correctness(exe_path, shape_profiles, dtype, gpu_id=None):
+            events.append(("check", str(exe_path)))
+            return [{"correct": True, "message": "ok"}]
+
+        def fake_benchmark(exe_path, op, gpu_id=None):
+            events.append(("bench", str(exe_path)))
+            return BenchmarkResult(latency_ms_median=1.0, latency_ms_p95=1.1)
+
+        state: GraphState = {
+            "operator_spec": sample_operator_spec,
+            "hardware_spec": sample_hardware_spec,
+            "run_state": sample_run_state,
+            "current_ncu": NcuMetrics(),
+            "current_code": "__global__ void base() {}",
+            "method_decision": MethodDecision(
+                method_name="tiling",
+                has_hyperparams=True,
+                hyperparams_schema={"tile": {"type": "int"}},
+            ),
+        }
+
+        with patch("cuda_opt_agent.agent.nodes._helpers.compile_cuda", side_effect=fake_compile), \
+             patch("cuda_opt_agent.agent.nodes.hp_search.check_correctness_multi", side_effect=fake_correctness), \
+             patch.object(nodes, "_benchmark_multi", side_effect=fake_benchmark):
+            result = run_async(nodes.hp_search_node(state))
+
+        assert [event[0] for event in events] == ["compile", "check", "bench"]
+        assert result["trial_compile_ok"] is True
+        assert result["trial_correctness_ok"] is True
+        assert result["trial_benchmark"].latency_ms_median == 1.0
 
     def test_hp_search_includes_known_hp_trials(self, sample_agent_config,
                                                       sample_operator_spec,
@@ -616,7 +781,7 @@ int main() { return 0; }
         result = run_async(nodes.apply_direct_node(state))
 
         assert result["new_code"]
-        assert llm.ainvoke.call_args.kwargs["temperature"] == 0.25
+        assert llm.ainvoke.call_args.kwargs["temperature"] == TEMP_APPLY_METHOD
 
     def test_hp_compile_worker_count_auto_uses_cpu_limit(self, sample_agent_config):
         config = sample_agent_config.model_copy(update={"hp_compile_workers": 0})

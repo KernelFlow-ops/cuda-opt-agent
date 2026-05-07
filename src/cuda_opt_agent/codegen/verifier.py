@@ -122,3 +122,5 @@ def generate_diff(old_code: str, new_code: str) -> str:
         lineterm="",
     )
     return "".join(diff)
+
+

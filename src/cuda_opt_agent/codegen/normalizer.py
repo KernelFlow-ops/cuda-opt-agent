@@ -72,3 +72,5 @@ def normalize_code_formatting(code: str) -> str:
             result.append(line)
             prev_empty = False
     return "\n".join(result).strip() + "\n"
+
+

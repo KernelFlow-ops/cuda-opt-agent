@@ -1,5 +1,9 @@
 """
 LLM 客户端抽象 —— 使用 LangChain 封装,支持 Anthropic / OpenAI。
+
+[优化]:
+  - ainvoke_tool_use: Tool Use (function calling) 替代自由 JSON 输出
+  - ainvoke_structured 优先走 tool use 路径
 """
 
 from __future__ import annotations
@@ -13,7 +17,7 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +71,14 @@ def _normalize_openai_base_url(base_url: str | None) -> str | None:
     if parsed.path in ("", "/"):
         return f"{normalized}/v1"
     return normalized
+
+
+# [优化] 可重试的异常类型
+_RETRYABLE_EXCEPTIONS = (
+    ConnectionError,
+    TimeoutError,
+    OSError,
+)
 
 
 class LLMClient:
@@ -124,10 +136,7 @@ class LLMClient:
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=30))
     def invoke(self, prompt: str, temperature: float | None = None) -> str:
-        """
-        调用 LLM,返回文本响应。
-        带自动重试。
-        """
+        """调用 LLM,返回文本响应。"""
         if self.stream_sink is not None:
             return _run_async_compat(self.ainvoke(prompt, temperature=temperature))
 
@@ -196,10 +205,7 @@ class LLMClient:
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=30))
     def invoke_structured(self, prompt: str, schema: type, temperature: float | None = None) -> Any:
-        """
-        调用 LLM 并解析结构化输出。
-        使用 LangChain 的 with_structured_output。
-        """
+        """调用 LLM 并解析结构化输出。"""
         if self.provider == "openai":
             text = self.invoke(prompt) if temperature is None else self.invoke(prompt, temperature=temperature)
             return self._manual_parse(text, schema)
@@ -211,7 +217,6 @@ class LLMClient:
             return result
         except Exception as e:
             logger.warning("Structured output parsing failed; falling back to manual parsing: %s", e)
-            # 降级: 调用普通 invoke 然后手动解析
             text = self.invoke(prompt) if temperature is None else self.invoke(prompt, temperature=temperature)
             return self._manual_parse(text, schema)
 
@@ -254,6 +259,56 @@ class LLMClient:
             stream_sink=stream_sink,
         )
         return self._extract_json(text)
+
+    # ════════════════════════════════════════
+    # [优化] Tool Use (function calling) 支持
+    # ════════════════════════════════════════
+
+    async def ainvoke_tool_use(
+        self,
+        prompt: str,
+        schema: type,
+        temperature: float | None = None,
+        *,
+        node_name: str | None = None,
+        stream_sink: LLMStreamSink | None = None,
+    ) -> Any:
+        """
+        [优化] 使用 Tool Use (function calling) 获取结构化输出。
+
+        优先尝试 with_structured_output (tool use), 失败回退到手动 JSON 解析。
+        """
+        llm = self._get_llm(temperature)
+        sink = stream_sink if stream_sink is not None else self.stream_sink
+
+        if sink is not None and node_name:
+            await _maybe_call(sink, "start_node", node_name)
+
+        try:
+            # 尝试使用 LangChain 的 with_structured_output (内部使用 tool use)
+            structured_llm = llm.with_structured_output(schema)
+            result = await structured_llm.ainvoke(prompt)
+
+            if sink is not None and node_name:
+                await _maybe_call(sink, "finish_node", "tool_use OK")
+            return result
+
+        except Exception as e:
+            logger.warning("Tool Use failed for %s; falling back to JSON parsing: %s",
+                           node_name or "unknown", e)
+
+            # 回退到流式文本 + 手动解析
+            text = await self.astream_text(
+                prompt,
+                temperature=temperature,
+                node_name=node_name,
+                stream_sink=stream_sink,
+            )
+            return self._manual_parse(text, schema)
+
+    # ════════════════════════════════════════
+    # 内部工具函数
+    # ════════════════════════════════════════
 
     @staticmethod
     def _response_to_text(response: Any) -> str:
@@ -311,7 +366,6 @@ class LLMClient:
         """从 LLM 输出中提取 JSON。"""
         import re
 
-        # 尝试从 ```json ... ``` 块中提取
         json_match = re.search(r"```json\s*\n(.*?)```", text, re.DOTALL)
         if json_match:
             try:
@@ -319,16 +373,13 @@ class LLMClient:
             except json.JSONDecodeError:
                 pass
 
-        # 尝试直接解析
         try:
-            # 找 { 或 [ 开头
             start = -1
             for i, ch in enumerate(text):
                 if ch in "{[":
                     start = i
                     break
             if start >= 0:
-                # 找到匹配的结束符
                 depth = 0
                 in_string = False
                 escape = False
@@ -367,10 +418,11 @@ class LLMClient:
     def format_prompt(self, template_name: str, **kwargs) -> str:
         """加载模板并填充变量。"""
         template = self.load_prompt(template_name)
-        # 对缺失的变量用空字符串填充
         import re
         placeholders = re.findall(r"\{(\w+)\}", template)
         for ph in placeholders:
             if ph not in kwargs:
                 kwargs[ph] = ""
         return template.format(**kwargs)
+
+

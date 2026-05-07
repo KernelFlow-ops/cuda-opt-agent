@@ -15,13 +15,14 @@ import orjson
 from ..models.data import IterationRecord, RunState, RunStatus
 
 logger = logging.getLogger(__name__)
+_NATIVE_PATH = type(Path("."))
 
 
 class PersistenceManager:
     """管理单次运行的产物目录与持久化。"""
 
     def __init__(self, runs_dir: str = "runs"):
-        self.runs_dir = Path(runs_dir)
+        self.runs_dir = _NATIVE_PATH(runs_dir)
         self.runs_dir.mkdir(parents=True, exist_ok=True)
 
     def create_run_dir(self, operator_name: str) -> Path:
@@ -207,3 +208,5 @@ class PersistenceManager:
 
         logger.error("Could not recover state: %s", run_dir)
         return None
+
+

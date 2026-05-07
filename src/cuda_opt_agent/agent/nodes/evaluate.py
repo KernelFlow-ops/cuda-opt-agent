@@ -1,3 +1,10 @@
+"""
+评估节点 —— 比较 trial 与 best 的性能。
+
+[修复]:
+  - 透传 hp_correctness_failures 和 hp_all_compiled_ok 给 reflect 节点
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -22,6 +29,9 @@ async def evaluate_node(self, state: dict) -> dict:
             "trial_accepted": False,
             "trial_compile_ok": state.get("trial_compile_ok", False),
             "trial_correctness_ok": state.get("trial_correctness_ok", False),
+            # [修复] 透传 correctness 失败详情
+            "hp_correctness_failures": state.get("hp_correctness_failures", []),
+            "hp_all_compiled_ok": state.get("hp_all_compiled_ok", False),
         }
 
     if state.get("trial_benchmark") and state.get("trial_version_id") == version_id:
@@ -37,6 +47,9 @@ async def evaluate_node(self, state: dict) -> dict:
                 "trial_accepted": False,
                 "trial_compile_ok": result.get("trial_compile_ok", False),
                 "trial_correctness_ok": result.get("trial_correctness_ok", False),
+                # [修复] 透传 correctness 失败详情
+                "hp_correctness_failures": state.get("hp_correctness_failures", []),
+                "hp_all_compiled_ok": state.get("hp_all_compiled_ok", False),
             }
 
         iter_dir = self.sm.run_dir / f"iter{version_id}"
@@ -65,4 +78,7 @@ async def evaluate_node(self, state: dict) -> dict:
         "trial_accepted": accepted,
         "trial_compile_ok": trial_compile_ok,
         "trial_correctness_ok": trial_correctness_ok,
+        # [修复] 透传 correctness 失败详情
+        "hp_correctness_failures": state.get("hp_correctness_failures", []),
+        "hp_all_compiled_ok": state.get("hp_all_compiled_ok", False),
     }

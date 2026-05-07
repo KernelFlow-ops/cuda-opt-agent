@@ -17,3 +17,5 @@ async def terminate_node(self, state: dict) -> dict:
         await asyncio.to_thread((self.sm.run_dir / "final_report.md").write_text, report, encoding="utf-8")
 
     return {"should_stop": True, "stop_reason": state.get("stop_reason", "done")}
+
+

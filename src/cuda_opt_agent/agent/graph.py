@@ -232,3 +232,5 @@ async def run_optimization_async(
         logger.error("Run failed with exception: %s", e, exc_info=True)
         await asyncio.to_thread(state_manager.mark_failed)
         raise
+
+

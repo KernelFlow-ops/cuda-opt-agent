@@ -163,3 +163,5 @@ class KnowledgeBase:
         """写入全局知识。"""
         kwargs["operator_class"] = "_global"
         self.write_entry(**kwargs)
+
+

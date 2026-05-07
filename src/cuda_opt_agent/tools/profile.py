@@ -801,3 +801,5 @@ def _write_combined_report(output_report_path: Path, metrics: NcuMetrics) -> Non
         output_report_path.write_text(format_ncu_for_prompt(metrics), encoding="utf-8")
     except Exception as e:
         logger.warning("Could not write combined ncu report %s: %s", output_report_path, e)
+
+

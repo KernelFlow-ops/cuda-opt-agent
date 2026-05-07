@@ -1,6 +1,13 @@
 """
 核心数据模型 —— 严格遵循技术总纲 §4 定义。
 所有结构均可序列化为 JSON。
+
+[优化] 新增字段:
+  - AgentConfig.gpu_ids: 多 GPU 候选分发
+  - AgentConfig.correctness_max_parallel: 跨 shape 并行校验
+  - AgentConfig.nvcc_parallel_threads: nvcc -t N
+  - AgentConfig.hp_llm_concurrency: hp_search LLM 并发数
+  - AgentConfig.use_code_diff: 代码 diff 模式
 """
 
 from __future__ import annotations
@@ -77,6 +84,14 @@ class HardwareSpec(BaseModel):
         """用于知识库匹配的硬件签名。"""
         gpu_short = self.gpu_name.lower().replace(" ", "_").replace("nvidia_", "")
         return f"{self.compute_capability}_{gpu_short}"
+
+
+class GpuDevice(BaseModel):
+    """[优化] 单块 GPU 设备信息, 用于多 GPU 分发。"""
+    index: int = 0
+    gpu_name: str = ""
+    compute_capability: str = ""
+    memory_total_mb: int = 0
 
 
 # ────────────────────────────────────────────
@@ -182,6 +197,38 @@ class AgentConfig(BaseModel):
     runs_dir: str = "runs"
     knowledge_base_dir: str = "knowledge_base"
 
+    # ── [优化] 新增字段 ──
+    gpu_ids: list[int] = Field(
+        default_factory=list,
+        description="可用 GPU 索引列表, 空=自动检测; 用于 hp 候选多 GPU 分发",
+    )
+    correctness_max_parallel: int = Field(
+        default=2,
+        description="跨 shape 并行正确性校验的最大并发数",
+    )
+    nvcc_parallel_threads: int = Field(
+        default=0,
+        description="nvcc -t N 编译并行线程数; 0=auto(cpu_count), 1=禁用",
+    )
+    hp_llm_concurrency: int = Field(
+        default=3,
+        description="hp_search 中 LLM 代码生成的最大并发数",
+    )
+    use_code_diff: bool = Field(
+        default=True,
+        description="为 apply/analyze 节点使用代码 diff 而非完整代码注入",
+    )
+    use_tool_use: bool = Field(
+        default=True,
+        description="对 JSON 输出节点使用 Tool Use (function calling) 替代自由 JSON",
+    )
+
+    # ── [修复] HP correctness 修复机制 ──
+    hp_correctness_repair_max: int = Field(
+        default=2,
+        description="HP 候选 correctness 失败时的最大修复尝试次数 (0=不修复, 直接丢弃)",
+    )
+
 
 # ────────────────────────────────────────────
 # 运行状态（续跑核心）
@@ -215,6 +262,18 @@ class RunState(BaseModel):
             if it.version_id == "v0":
                 break
             if not it.accepted:
+                count += 1
+            else:
+                break
+        return count
+
+    def consecutive_correctness_failures(self) -> int:
+        """[修复] 统计尾部连续的 correctness 失败次数 (不区分是否 accepted)。"""
+        count = 0
+        for it in reversed(self.iterations):
+            if it.version_id == "v0":
+                break
+            if not it.correctness_ok:
                 count += 1
             else:
                 break
@@ -268,3 +327,5 @@ class KnowledgeEntry(BaseModel):
 # ────────────────────────────────────────────
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+

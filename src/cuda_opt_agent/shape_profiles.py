@@ -134,3 +134,5 @@ def profile_weight(profile: ShapeProfile) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 1.0
+
+

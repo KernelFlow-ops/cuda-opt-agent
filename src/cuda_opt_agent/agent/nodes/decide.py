@@ -1,3 +1,10 @@
+"""
+Decide 节点 —— LLM 决策下一个优化方法。
+
+[优化]:
+  - 支持 use_tool_use: 使用 Tool Use (function calling) 替代自由 JSON
+"""
+
 from __future__ import annotations
 
 import json
@@ -64,12 +71,35 @@ async def decide_node(self, state: dict) -> dict:
     decision: MethodDecision | None = None
     max_reselects = max(0, self.sm.config.decide_reselect_max_retries)
     for attempt in range(max_reselects + 1):
-        decision_data = await self.llm.ainvoke_json(
-            build_prompt(),
-            temperature=TEMP_DECIDE,
-            node_name="decide",
-        )
-        decision = MethodDecision.model_validate(decision_data)
+        prompt = build_prompt()
+        # [优化] 根据配置选择 Tool Use 或自由 JSON
+        if self.sm.config.use_tool_use:
+            try:
+                tool_result = await self.llm.ainvoke_tool_use(
+                    prompt,
+                    MethodDecision,
+                    temperature=TEMP_DECIDE,
+                    node_name="decide",
+                )
+                if isinstance(tool_result, MethodDecision):
+                    decision = tool_result
+                else:
+                    decision = MethodDecision.model_validate(tool_result)
+            except Exception as e:
+                logger.warning("Tool Use failed for decide, falling back to JSON: %s", e)
+                decision_data = await self.llm.ainvoke_json(
+                    prompt,
+                    temperature=TEMP_DECIDE,
+                    node_name="decide",
+                )
+                decision = MethodDecision.model_validate(decision_data)
+        else:
+            decision_data = await self.llm.ainvoke_json(
+                prompt,
+                temperature=TEMP_DECIDE,
+                node_name="decide",
+            )
+            decision = MethodDecision.model_validate(decision_data)
 
         if decision.give_up:
             break
@@ -109,3 +139,5 @@ async def decide_node(self, state: dict) -> dict:
         "method_decision": decision,
         "has_hyperparams": decision.has_hyperparams,
     }
+
+

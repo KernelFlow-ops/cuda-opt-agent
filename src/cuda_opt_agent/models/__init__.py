@@ -2,6 +2,7 @@ from .data import (
     AgentConfig,
     BenchmarkResult,
     BlacklistEntry,
+    GpuDevice,
     HardwareSpec,
     HyperparamCandidate,
     IterationRecord,
@@ -20,6 +21,7 @@ __all__ = [
     "AgentConfig",
     "BenchmarkResult",
     "BlacklistEntry",
+    "GpuDevice",
     "HardwareSpec",
     "HyperparamCandidate",
     "IterationRecord",
@@ -34,3 +36,5 @@ __all__ = [
     "make_blacklist_key",
     "normalize_method_name",
 ]
+
+

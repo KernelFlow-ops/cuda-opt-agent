@@ -49,3 +49,5 @@
 1. bottlenecks 按 severity 降序排列
 2. 每个 bottleneck 都有 ncu 数据支撑
 3. 不要臆测,只基于实际数据分析
+
+

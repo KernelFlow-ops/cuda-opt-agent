@@ -108,3 +108,5 @@ class LiveReasoningStream:
             f"  [{color}]DONE {self._current_node}[/{color}]"
             + (f": {summary}" if summary else "")
         )
+
+

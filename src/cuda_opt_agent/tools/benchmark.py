@@ -1,12 +1,15 @@
 """
 Benchmark 工具 —— 使用 cudaEvent 精确测量 kernel latency。
-多次预热 + 多轮测量,取中位数和 P95。
+
+[优化]:
+  - run_benchmark / run_benchmark_multi: 支持 gpu_id 参数
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,49 +28,53 @@ def run_benchmark(
     measure_rounds: int = 100,
     timeout: int = 300,
     extra_args: list[str] | None = None,
+    gpu_id: int | None = None,
 ) -> BenchmarkResult:
     """
     运行已编译的 benchmark 可执行文件。
 
-    可执行文件必须输出 JSON 格式到 stdout:
-    {
-        "latencies_ms": [0.123, 0.124, ...],
-        "throughput_gflops": 1234.5  // optional
-    }
-
-    Args:
-        executable_path: 可执行文件路径
-        warmup_rounds: 预热轮数
-        measure_rounds: 测量轮数
-        timeout: 执行超时
-
-    Returns:
-        BenchmarkResult
+    [优化] 新增 gpu_id 参数, 通过 CUDA_VISIBLE_DEVICES 指定 GPU。
     """
     exe = Path(executable_path)
     if not exe.exists():
         logger.error("Executable not found: %s", exe)
         return BenchmarkResult()
 
-    cmd = [str(exe)]
-    if extra_args:
-        cmd.extend(extra_args)
-    cmd.extend(["--warmup", str(warmup_rounds), "--rounds", str(measure_rounds)])
+    shape_args = list(extra_args or [])
+    attempts = [
+        ("rounds", [str(exe), *shape_args, "--warmup", str(warmup_rounds), "--rounds", str(measure_rounds)]),
+        ("iters_benchmark", [str(exe), "--benchmark", *shape_args, "--warmup", str(warmup_rounds), "--iters", str(measure_rounds)]),
+        ("iters", [str(exe), *shape_args, "--warmup", str(warmup_rounds), "--iters", str(measure_rounds)]),
+    ]
+
+    # [优化] 设置 CUDA_VISIBLE_DEVICES
+    env = None
+    if gpu_id is not None:
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+        failures = []
+        for arg_style, cmd in attempts:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
+            )
 
-        if result.returncode != 0:
-            logger.error("Benchmark execution failed:\nstdout: %s\nstderr: %s",
-                         result.stdout[:2000], result.stderr[:2000])
-            return BenchmarkResult()
+            if result.returncode == 0:
+                bm = _parse_benchmark_output(result.stdout)
+                bm.extra["benchmark_arg_style"] = arg_style
+                return bm
 
-        return _parse_benchmark_output(result.stdout)
+            failures.append((arg_style, result.stdout, result.stderr))
+
+        last_style, last_stdout, last_stderr = failures[-1]
+        logger.error("Benchmark execution failed after %d argument styles (last=%s):\nstdout: %s\nstderr: %s",
+                     len(failures), last_style, last_stdout[:2000], last_stderr[:2000])
+        return BenchmarkResult()
 
     except subprocess.TimeoutExpired:
         logger.error("Benchmark timed out (%ds)", timeout)
@@ -85,8 +92,13 @@ def run_benchmark_multi(
     timeout: int = 300,
     extra_args: list[str] | None = None,
     aggregator: Literal["mean", "worst", "weighted"] = "mean",
+    gpu_id: int | None = None,
 ) -> BenchmarkResult:
-    """Run benchmark once per shape profile and aggregate latency."""
+    """
+    Run benchmark once per shape profile and aggregate latency.
+
+    [优化] 支持 gpu_id 参数。
+    """
     profiles = shape_profiles or [{}]
     per_shape = []
     for profile in profiles:
@@ -100,6 +112,7 @@ def run_benchmark_multi(
             measure_rounds=measure_rounds,
             timeout=timeout,
             extra_args=args,
+            gpu_id=gpu_id,
         )
         per_shape.append({
             "shape": profile,
@@ -128,6 +141,9 @@ def run_benchmark_multi(
         aggregate_p95 = sum(p95s) / len(p95s)
 
     worst_idx = max(range(len(per_shape)), key=lambda i: per_shape[i]["latency_ms_median"]) if per_shape else 0
+    arg_style = None
+    if per_shape:
+        arg_style = per_shape[worst_idx].get("extra", {}).get("benchmark_arg_style")
     return BenchmarkResult(
         latency_ms_median=aggregate_latency,
         latency_ms_p95=aggregate_p95,
@@ -139,6 +155,7 @@ def run_benchmark_multi(
             "shape_count": len(per_shape),
             "worst_shape": per_shape[worst_idx]["shape"] if per_shape else {},
             "worst_shape_label": per_shape[worst_idx]["shape_label"] if per_shape else "default",
+            "benchmark_arg_style": arg_style,
         },
     )
 
@@ -185,7 +202,7 @@ def _extract_json_objects(stdout: str) -> list[dict]:
 
 
 def _parse_key_value_output(stdout: str) -> dict:
-    """Parse simple key=value benchmark output emitted by some LLM harnesses."""
+    """Parse simple key=value benchmark output."""
     data = {}
     for line in stdout.splitlines():
         if "=" not in line:
@@ -234,77 +251,3 @@ def _benchmark_result_from_dict(data: dict) -> BenchmarkResult:
     )
 
 
-def generate_benchmark_harness(
-    operator_spec,  # OperatorSpec
-    kernel_header: str = "kernel.cuh",
-    output_path: str | Path = "benchmark_harness.cu",
-) -> str:
-    """
-    根据算子规格生成 C++ benchmark harness 模板代码。
-    返回生成的文件路径。
-    """
-    output_path = Path(output_path)
-
-    harness_code = f'''
-// Auto-generated benchmark harness for {operator_spec.name}
-#include <cuda_runtime.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include "{kernel_header}"
-
-#define CHECK_CUDA(call) do {{ \\
-    cudaError_t err = call; \\
-    if (err != cudaSuccess) {{ \\
-        fprintf(stderr, "CUDA error at %s:%d: %s\\n", __FILE__, __LINE__, cudaGetErrorString(err)); \\
-        exit(1); \\
-    }} \\
-}} while(0)
-
-int main(int argc, char** argv) {{
-    int warmup = 10;
-    int rounds = 100;
-
-    for (int i = 1; i < argc; i++) {{
-        if (strcmp(argv[i], "--warmup") == 0 && i + 1 < argc) warmup = atoi(argv[++i]);
-        if (strcmp(argv[i], "--rounds") == 0 && i + 1 < argc) rounds = atoi(argv[++i]);
-    }}
-
-    // TODO: 由 LLM 根据 OperatorSpec 填充具体的内存分配和 kernel 调用
-    // 以下为框架模板
-
-    cudaEvent_t start, stop;
-    CHECK_CUDA(cudaEventCreate(&start));
-    CHECK_CUDA(cudaEventCreate(&stop));
-
-    // Warmup
-    for (int i = 0; i < warmup; i++) {{
-        // kernel_launch(...);
-        CHECK_CUDA(cudaDeviceSynchronize());
-    }}
-
-    // Measure
-    float* latencies = (float*)malloc(rounds * sizeof(float));
-    for (int i = 0; i < rounds; i++) {{
-        CHECK_CUDA(cudaEventRecord(start));
-        // kernel_launch(...);
-        CHECK_CUDA(cudaEventRecord(stop));
-        CHECK_CUDA(cudaEventSynchronize(stop));
-        CHECK_CUDA(cudaEventElapsedTime(&latencies[i], start, stop));
-    }}
-
-    // Output JSON
-    printf("{{\\n  \\"latencies_ms\\": [");
-    for (int i = 0; i < rounds; i++) {{
-        printf("%.6f%s", latencies[i], i < rounds - 1 ? ", " : "");
-    }}
-    printf("]\\n}}\\n");
-
-    free(latencies);
-    CHECK_CUDA(cudaEventDestroy(start));
-    CHECK_CUDA(cudaEventDestroy(stop));
-    return 0;
-}}
-'''
-    output_path.write_text(harness_code, encoding="utf-8")
-    return str(output_path)
