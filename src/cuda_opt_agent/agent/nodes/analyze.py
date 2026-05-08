@@ -55,5 +55,3 @@ async def analyze_node(self, state: dict) -> dict:
 
     analysis = await self.llm.ainvoke_json(prompt, temperature=TEMP_ANALYZE, node_name="analyze")
     return {"analysis_result": analysis}
-
-

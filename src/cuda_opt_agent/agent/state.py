@@ -4,6 +4,9 @@ LangGraph 状态定义 —— 节点间通过 GraphState 通信。
 [修复] 新增字段:
   - hp_correctness_failures: HP 候选的 correctness 失败详情
   - hp_all_compiled_ok: 区分编译失败 vs correctness 失败
+
+[改进] 新增字段:
+  - library_baseline_ms: cuDNN/cuBLAS 等价实现 latency
 """
 
 from __future__ import annotations
@@ -65,3 +68,6 @@ class GraphState(TypedDict, total=False):
     # ── 内部路由 ──
     has_hyperparams: bool
     iteration_count: int
+
+    # ── [改进] Library 基线 ──
+    library_baseline_ms: float | None

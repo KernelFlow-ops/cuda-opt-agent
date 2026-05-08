@@ -47,5 +47,3 @@ async def profile_best_node(self, state: dict) -> dict:
         "current_code": code,
         "run_state": self.sm.state,
     }
-
-

@@ -14,5 +14,3 @@ __all__ = [
     "check_correctness_multi",
     "collect_hardware_info",
 ]
-
-

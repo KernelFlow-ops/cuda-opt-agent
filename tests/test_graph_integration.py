@@ -36,7 +36,7 @@ class TestGraphRouting:
     def test_route_after_compile_success(self):
         from cuda_opt_agent.agent.graph import _route_after_compile
         state = {"trial_compile_ok": True, "trial_correctness_ok": True}
-        assert _route_after_compile(state) == "profile_best"
+        assert _route_after_compile(state) == "compare_library"
 
     def test_route_after_compile_failure(self):
         from cuda_opt_agent.agent.graph import _route_after_compile
@@ -346,21 +346,31 @@ int main() { return 0; }
         assert '"tile": 128' in method_history
         assert "1.5000 ms" in method_history
 
-    def test_decide_node_give_up(self, sample_agent_config, sample_operator_spec,
-                                       sample_hardware_spec, sample_run_state,
-                                       sample_benchmark_result):
+    def test_decide_node_reselects_premature_give_up(self, sample_agent_config, sample_operator_spec,
+                                                           sample_hardware_spec, sample_run_state,
+                                                           sample_benchmark_result):
         nodes, sm, llm = self._make_nodes(sample_agent_config)
         sm.state = sample_run_state
 
         llm.format_prompt.return_value = "test prompt"
-        llm.ainvoke_json.return_value = {
-            "method_name": "none",
-            "has_hyperparams": False,
-            "rationale": "所有方向已尝试",
-            "expected_impact": "none",
-            "confidence": 0.0,
-            "give_up": True,
-        }
+        llm.ainvoke_json.side_effect = [
+            {
+                "method_name": "none",
+                "has_hyperparams": False,
+                "rationale": "所有方向已尝试",
+                "expected_impact": "none",
+                "confidence": 0.0,
+                "give_up": True,
+            },
+            {
+                "method_name": "register_cleanup",
+                "has_hyperparams": False,
+                "rationale": "forced continue until max_iterations",
+                "expected_impact": "low",
+                "confidence": 0.2,
+                "give_up": False,
+            },
+        ]
 
         state: GraphState = {
             "operator_spec": sample_operator_spec,
@@ -370,8 +380,10 @@ int main() { return 0; }
             "analysis_result": {},
         }
         result = run_async(nodes.decide_node(state))
-        assert result["should_stop"] is True
-        assert llm.ainvoke_json.call_count == 1
+        assert "should_stop" not in result
+        assert result["method_decision"].method_name == "register_cleanup"
+        assert llm.ainvoke_json.call_count == 2
+        assert "LLM returned give_up" in llm.format_prompt.call_args_list[1].kwargs["forced_continue"]
 
     def test_decide_node_reselects_blacklisted_method(self, sample_agent_config,
                                                             sample_operator_spec,
@@ -419,12 +431,12 @@ int main() { return 0; }
         assert llm.ainvoke_json.call_count == 2
         assert "tiling" in llm.format_prompt.call_args_list[1].kwargs["rejected_methods"]
 
-    def test_decide_node_gives_up_after_reselect_retries_exhausted(self,
-                                                                        sample_agent_config,
-                                                                        sample_operator_spec,
-                                                                        sample_hardware_spec,
-                                                                        sample_run_state,
-                                                                        sample_benchmark_result):
+    def test_decide_node_falls_back_after_reselect_retries_exhausted(self,
+                                                                          sample_agent_config,
+                                                                          sample_operator_spec,
+                                                                          sample_hardware_spec,
+                                                                          sample_run_state,
+                                                                          sample_benchmark_result):
         config = sample_agent_config.model_copy(update={"decide_reselect_max_retries": 2})
         nodes, sm, llm = self._make_nodes(config)
         sm.state = sample_run_state
@@ -452,9 +464,9 @@ int main() { return 0; }
         }
         result = run_async(nodes.decide_node(state))
 
-        assert result["should_stop"] is True
-        assert result["method_decision"].give_up is True
-        assert "exhausted decide reselection retries" in result["stop_reason"]
+        assert "should_stop" not in result
+        assert result["method_decision"].give_up is False
+        assert result["method_decision"].method_name.startswith("forced_continue_")
         assert llm.ainvoke_json.call_count == 3
 
     def test_hp_search_compiles_all_candidates_before_gpu_work(self, sample_agent_config,

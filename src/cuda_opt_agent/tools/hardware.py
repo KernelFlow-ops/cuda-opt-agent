@@ -1,6 +1,6 @@
 """
 硬件信息采集 —— 启动时调用,结果注入所有 Prompt。
-使用 pynvml + nvidia-smi + nvcc 探测。
+使用 nvidia-ml-py/pynvml + nvidia-smi + nvcc 探测。
 """
 
 from __future__ import annotations
@@ -17,11 +17,11 @@ logger = logging.getLogger(__name__)
 def collect_hardware_info() -> HardwareSpec:
     """
     采集当前机器的 GPU 硬件信息。
-    优先用 pynvml,不可用时 fallback 到 nvidia-smi 解析。
+    优先用 nvidia-ml-py 提供的 pynvml 模块,不可用时 fallback 到 nvidia-smi 解析。
     """
     spec = HardwareSpec()
 
-    # ── 1) pynvml ──
+    # ── 1) NVML Python bindings (module name: pynvml) ──
     try:
         import pynvml
         pynvml.nvmlInit()
@@ -35,10 +35,10 @@ def collect_hardware_info() -> HardwareSpec:
         major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
         spec.compute_capability = f"sm_{major}{minor}"
 
-        try:
-            spec.sm_count = pynvml.nvmlDeviceGetNumGpuCores(handle)
-        except Exception:
-            spec.sm_count = _query_sm_count_fallback(spec.compute_capability)
+        spec.sm_count = (
+            _query_sm_count_nvidia_smi()
+            or _query_sm_count_fallback(spec.compute_capability, spec.gpu_name)
+        )
 
         spec.has_tensor_cores = major >= 7
 
@@ -114,16 +114,68 @@ def _fill_from_nvidia_smi(spec: HardwareSpec) -> None:
             spec.driver_version = parts[2].strip()
             major = int(cc[0]) if cc else 0
             spec.has_tensor_cores = major >= 7
+            spec.sm_count = (
+                _query_sm_count_nvidia_smi()
+                or _query_sm_count_fallback(spec.compute_capability, spec.gpu_name)
+            )
     except Exception as e:
         logger.error("Failed to parse nvidia-smi output: %s", e)
 
 
-def _query_sm_count_fallback(cc: str) -> int:
-    """根据已知架构返回 SM 数量近似值。"""
+def _query_sm_count_nvidia_smi() -> int:
+    """Query the exact SM count when nvidia-smi exposes it."""
+    nvidia_smi = shutil.which("nvidia-smi")
+    if not nvidia_smi:
+        return 0
+    try:
+        result = subprocess.run(
+            [nvidia_smi, "--query-gpu=multiprocessor_count", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return 0
+        value = result.stdout.strip().splitlines()[0].strip()
+        return int(value) if value else 0
+    except Exception:
+        return 0
+
+
+def _sm_count_from_gpu_name(gpu_name: str | None) -> int:
+    if not gpu_name:
+        return 0
+    name = gpu_name.lower()
+    known_by_name = [
+        ("geforce rtx 3090 ti", 84),
+        ("geforce rtx 3090", 82),
+        ("geforce rtx 3080 ti", 80),
+        ("geforce rtx 3080", 68),
+        ("geforce rtx 3070 ti", 48),
+        ("geforce rtx 3070", 46),
+        ("geforce rtx 3060 ti", 38),
+        ("geforce rtx 3060 laptop", 30),
+        ("geforce rtx 3060", 28),
+        ("rtx a6000", 84),
+        ("rtx a5000", 64),
+        ("rtx a4000", 48),
+        ("a40", 84),
+        ("a10", 72),
+        ("a2", 16),
+    ]
+    for needle, sm_count in known_by_name:
+        if needle in name:
+            return sm_count
+    return 0
+
+
+def _query_sm_count_fallback(cc: str, gpu_name: str | None = None) -> int:
+    """Return a conservative SM count fallback for known devices."""
+    by_name = _sm_count_from_gpu_name(gpu_name)
+    if by_name:
+        return by_name
+
     known = {
         "sm_90": 132,   # H100
         "sm_89": 128,   # RTX 4090
-        "sm_86": 82,    # RTX 3090
         "sm_80": 108,   # A100
         "sm_75": 72,    # T4
         "sm_70": 80,    # V100
@@ -158,5 +210,3 @@ def _parse_raw_dump_extras(spec: HardwareSpec) -> None:
     if spec.l2_cache_mb == 0:
         defaults = {"sm_90": 50, "sm_89": 72, "sm_86": 6, "sm_80": 40, "sm_75": 4, "sm_70": 6}
         spec.l2_cache_mb = defaults.get(spec.compute_capability, 4)
-
-

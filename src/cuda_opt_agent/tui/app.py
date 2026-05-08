@@ -98,5 +98,3 @@ class CudaOptApp:
                 f"v0: {v0.benchmark.latency_ms_median:.4f} ms -> "
                 f"{best.version_id}: {best.benchmark.latency_ms_median:.4f} ms"
             )
-
-

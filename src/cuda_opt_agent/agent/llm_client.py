@@ -424,5 +424,3 @@ class LLMClient:
             if ph not in kwargs:
                 kwargs[ph] = ""
         return template.format(**kwargs)
-
-

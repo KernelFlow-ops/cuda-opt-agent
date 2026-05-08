@@ -45,6 +45,7 @@ class GpuPool:
     def _detect_gpus(self) -> list[int]:
         """检测可用 GPU 数量。"""
         try:
+            # Provided by the nvidia-ml-py package; import name remains pynvml.
             import pynvml
             pynvml.nvmlInit()
             count = pynvml.nvmlDeviceGetCount()
@@ -488,5 +489,3 @@ def _generate_final_report(self, run_state) -> str:
         lines.append(f"| {it.version_id} | {it.method_name or 'baseline'} | {lat} | {per_shape} | {status} |")
 
     return "\n".join(lines)
-
-

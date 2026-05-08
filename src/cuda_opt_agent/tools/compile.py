@@ -45,6 +45,35 @@ def _auto_nvcc_threads() -> int:
     return min(cpu, 8)
 
 
+def _auto_link_flags(source_path: Path) -> list[str]:
+    """Infer CUDA library link flags from common library headers."""
+    try:
+        text = source_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return []
+
+    flags: list[str] = []
+    if "cublasLt.h" in text:
+        flags.extend(["-lcublasLt", "-lcublas"])
+    elif "cublas_v2.h" in text:
+        flags.append("-lcublas")
+    if "cudnn.h" in text:
+        flags.append("-lcudnn")
+    return flags
+
+
+def _dedupe_flags(flags: list[str]) -> list[str]:
+    """Preserve flag order while dropping exact duplicates."""
+    result: list[str] = []
+    seen: set[str] = set()
+    for flag in flags:
+        if flag in seen:
+            continue
+        seen.add(flag)
+        result.append(flag)
+    return result
+
+
 def compile_cuda(
     source_path: str | Path,
     output_path: str | Path | None = None,
@@ -106,8 +135,10 @@ def compile_cuda(
     if effective_threads > 1:
         cmd.extend(["-t", str(effective_threads)])
 
-    if extra_flags:
-        cmd.extend(extra_flags)
+    inferred_flags = _auto_link_flags(source_path)
+    all_extra_flags = _dedupe_flags([*(extra_flags or []), *inferred_flags])
+    if all_extra_flags:
+        cmd.extend(all_extra_flags)
 
     logger.info("Compile command: %s", " ".join(cmd))
 
@@ -203,5 +234,3 @@ def compile_with_benchmark_harness(
         return CompileResult(success=False, stderr=f"Compilation timed out ({timeout}s)")
     except Exception as e:
         return CompileResult(success=False, stderr=f"Compilation error: {e}")
-
-

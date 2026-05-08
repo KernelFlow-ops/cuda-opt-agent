@@ -180,6 +180,43 @@ class TestCompileTool:
         assert result.success is False
         assert "nvcc" in result.stderr.lower()
 
+    def test_compile_auto_links_cuda_libraries(self, tmp_dir, monkeypatch):
+        from cuda_opt_agent.tools import compile as compile_module
+
+        src = tmp_dir / "test.cu"
+        src.write_text(
+            "\n".join([
+                "#include <cuda_runtime.h>",
+                "#include <cublas_v2.h>",
+                "#include <cublasLt.h>",
+                "#include <cudnn.h>",
+                "int main() { return 0; }",
+            ]),
+            encoding="utf-8",
+        )
+        calls = []
+
+        class Result:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return Result()
+
+        monkeypatch.setattr(compile_module.shutil, "which", lambda name: "/usr/bin/nvcc" if name == "nvcc" else None)
+        monkeypatch.setattr(compile_module.subprocess, "run", fake_run)
+
+        result = compile_module.compile_cuda(src, extra_flags=["-lcublas"])
+
+        assert result.success is True
+        cmd = calls[0]
+        assert "-lcublasLt" in cmd
+        assert "-lcublas" in cmd
+        assert "-lcudnn" in cmd
+        assert cmd.count("-lcublas") == 1
+
 
 class TestBenchmarkTool:
     def test_parse_json_output(self):
@@ -484,4 +521,6 @@ class TestHardwareTool:
         from cuda_opt_agent.tools.hardware import _query_sm_count_fallback
         assert _query_sm_count_fallback("sm_80") == 108
         assert _query_sm_count_fallback("sm_90") == 132
+        assert _query_sm_count_fallback("sm_86", "NVIDIA GeForce RTX 3060") == 28
+        assert _query_sm_count_fallback("sm_86") == 0
         assert _query_sm_count_fallback("sm_99") == 0

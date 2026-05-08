@@ -7,6 +7,7 @@ from .data import (
     HyperparamCandidate,
     IterationRecord,
     KnowledgeEntry,
+    MetaDecision,
     MethodDecision,
     NcuMetrics,
     NodeName,
@@ -15,7 +16,14 @@ from .data import (
     RunState,
     RunStatus,
 )
-from .enums import make_blacklist_key, normalize_method_name
+from .enums import (
+    OPTIMIZATION_SUBSPACES,
+    SUBSPACE_KEYWORDS,
+    infer_subspace_from_method_name,
+    make_blacklist_key,
+    normalize_method_name,
+    subspaces_overlap,
+)
 
 __all__ = [
     "AgentConfig",
@@ -26,15 +34,18 @@ __all__ = [
     "HyperparamCandidate",
     "IterationRecord",
     "KnowledgeEntry",
+    "MetaDecision",
     "MethodDecision",
     "NcuMetrics",
     "NodeName",
+    "OPTIMIZATION_SUBSPACES",
     "OperatorSpec",
     "Outcome",
     "RunState",
     "RunStatus",
+    "SUBSPACE_KEYWORDS",
+    "infer_subspace_from_method_name",
     "make_blacklist_key",
     "normalize_method_name",
+    "subspaces_overlap",
 ]
-
-

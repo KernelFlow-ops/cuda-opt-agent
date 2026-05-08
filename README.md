@@ -175,7 +175,7 @@ CONSOLE_ENCODING=auto
 ### Natural Language
 
 ```bash
-cuda-opt new layernorm --task "写一个 fp16 layernorm"
+cuda-opt new layernorm --task "写一个 fp16 layernorm" --shapes "1024^2;2048^2;4096^2"
 ```
 
 ### Structured Spec
@@ -199,7 +199,7 @@ cuda-opt run gemm --shapes "1024^3;2048^3;4096^3" --multi-shape-aggregator worst
 ### Resume
 
 ```bash
-cuda-opt resume runs/batchnorm_run_20260506T030613
+cuda-opt resume runs/layernorm_run_20260507T1
 ```
 
 ### Inspect

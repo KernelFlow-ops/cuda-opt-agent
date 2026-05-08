@@ -692,8 +692,11 @@ def resume(
         raise typer.Exit(1)
 
 
-def _list_runs_impl(runs_dir: str) -> None:
+def _list_runs_impl(runs_dir: str | None = None) -> None:
     from rich.table import Table
+
+    if runs_dir is None:
+        runs_dir = load_config().runs_dir
 
     runs_path = Path(runs_dir)
     if not runs_path.exists():
@@ -737,7 +740,7 @@ def _list_runs_impl(runs_dir: str) -> None:
 
 @app.command("list-runs", hidden=True)
 def list_runs(
-    runs_dir: str = typer.Option("runs", "--dir", help="Runs directory"),
+    runs_dir: Optional[str] = typer.Option(None, "--dir", help="Runs directory (defaults to RUNS_DIR config)"),
 ) -> None:
     """List all runs."""
     _list_runs_impl(runs_dir)
@@ -745,7 +748,7 @@ def list_runs(
 
 @app.command("list")
 def list_command(
-    runs_dir: str = typer.Option("runs", "--dir", help="Runs directory"),
+    runs_dir: Optional[str] = typer.Option(None, "--dir", help="Runs directory (defaults to RUNS_DIR config)"),
 ) -> None:
     """List all runs."""
     _list_runs_impl(runs_dir)
@@ -825,5 +828,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-

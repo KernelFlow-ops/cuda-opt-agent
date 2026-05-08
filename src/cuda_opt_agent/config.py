@@ -79,6 +79,8 @@ def load_config(env_path: str | Path | None = None) -> AgentConfig:
         use_tool_use=os.getenv("USE_TOOL_USE", "true").strip().lower() in {"1", "true", "yes", "on"},
         # [修复] 新增字段
         hp_correctness_repair_max=int(os.getenv("HP_CORRECTNESS_REPAIR_MAX", "2")),
+        enable_library_comparison=os.getenv("ENABLE_LIBRARY_COMPARISON", "true").strip().lower()
+        in {"1", "true", "yes", "on"},
     )
 
 

@@ -1,6 +1,11 @@
 """
 跨运行知识库 —— 按算子大类组织,提供软提示。
 哲学:初始为空,随运行积累,永远以软提示形式注入 Prompt。
+
+[改进]:
+  - 支持 negative polarity 条目（失败教训）
+  - format_hints_for_prompt 区分正面/负面经验,负面用醒目标记
+  - write_entry 支持 polarity 参数
 """
 
 from __future__ import annotations
@@ -57,15 +62,25 @@ class KnowledgeBase:
         查询与当前 (算子, 硬件) 匹配的知识条目。
 
         同时附上全局知识 (_global.json) 的高分条目。
+        [改进] 负面条目也会返回,排序时负面在前(作为警告)。
         """
         results = []
 
         # 1) 算子特定知识
         op_entries = self._load_file(self._file_for(operator_class))
         matched = [e for e in op_entries if e.hardware_signature == hardware_signature]
-        # 按 aggregate_speedup * confidence 排序
-        matched.sort(key=lambda e: e.aggregate_speedup * e.confidence, reverse=True)
-        results.extend(matched[:top_k])
+
+        # [改进] 分开排序：负面条目优先（按回归严重程度）,正面按加速比
+        negative = [e for e in matched if e.polarity == "negative"]
+        positive = [e for e in matched if e.polarity != "negative"]
+
+        # 负面按回归程度排序 (aggregate_speedup 越小 = 回归越严重,排在前面)
+        negative.sort(key=lambda e: e.aggregate_speedup)
+        # 正面按加速比 * 置信度排序
+        positive.sort(key=lambda e: e.aggregate_speedup * e.confidence, reverse=True)
+
+        results.extend(negative[:top_k])
+        results.extend(positive[:top_k])
 
         # 2) 全局知识
         global_entries = self._load_file(self._file_for("_global"))
@@ -76,22 +91,47 @@ class KnowledgeBase:
         return results
 
     def format_hints_for_prompt(self, entries: list[KnowledgeEntry]) -> str:
-        """格式化知识条目为 Prompt 软提示。"""
+        """
+        格式化知识条目为 Prompt 软提示。
+
+        [改进] 区分正面/负面经验,负面用醒目标记。
+        """
         if not entries:
             return "（暂无历史经验）"
 
+        negative = [e for e in entries if e.polarity == "negative"]
+        positive = [e for e in entries if e.polarity != "negative"]
+
         lines = []
-        for i, entry in enumerate(entries, 1):
-            speedup = entry.aggregate_speedup
-            direction = "加速" if speedup > 1.0 else "减速"
-            hp_info = ""
-            if entry.hyperparams_pattern:
-                hp_info = f", 超参模式: {entry.hyperparams_pattern}"
-            lines.append(
-                f"{i}. [{entry.operator_class}] 方法: {entry.method_name}{hp_info}\n"
-                f"   观测: {direction} {speedup:.2f}x, 置信度: {entry.confidence:.2f}\n"
-                f"   备注: {entry.notes}"
-            )
+
+        if negative:
+            lines.append("### ⚠️ 已知反模式（在相似硬件/算子上曾导致显著回归，**强烈建议避免**）")
+            for i, entry in enumerate(negative, 1):
+                regression = 1.0 / entry.aggregate_speedup if entry.aggregate_speedup > 0 else float("inf")
+                hp_info = ""
+                if entry.hyperparams_pattern:
+                    hp_info = f", 超参模式: {entry.hyperparams_pattern}"
+                lines.append(
+                    f"  {i}. ❌ [{entry.operator_class}] 方法: {entry.method_name}{hp_info}\n"
+                    f"     回归: {regression:.2f}x 变慢, 置信度: {entry.confidence:.2f}\n"
+                    f"     教训: {entry.notes}"
+                )
+
+        if positive:
+            if negative:
+                lines.append("")
+            lines.append("### ✓ 历史有效经验")
+            for i, entry in enumerate(positive, 1):
+                speedup = entry.aggregate_speedup
+                hp_info = ""
+                if entry.hyperparams_pattern:
+                    hp_info = f", 超参模式: {entry.hyperparams_pattern}"
+                lines.append(
+                    f"  {i}. ✅ [{entry.operator_class}] 方法: {entry.method_name}{hp_info}\n"
+                    f"     加速: {speedup:.2f}x, 置信度: {entry.confidence:.2f}\n"
+                    f"     备注: {entry.notes}"
+                )
+
         return "\n".join(lines)
 
     def write_entry(
@@ -105,10 +145,15 @@ class KnowledgeBase:
         operator_shape_signature: str = "",
         hyperparams_pattern: dict | None = None,
         notes: str = "",
+        polarity: str = "positive",
     ) -> None:
         """
         写入或更新一条知识。
         使用 EWMA 更新 aggregate_speedup。
+
+        [改进] 新增 polarity 参数:
+          - "positive": 成功经验 (speedup > 1.0)
+          - "negative": 失败教训 (speedup < 1.0, 表示回归)
         """
         path = self._file_for(operator_class)
         entries = self._load_file(path)
@@ -120,13 +165,14 @@ class KnowledgeBase:
             operator_shape_signature=operator_shape_signature,
         )
 
-        # 查找是否已有同方法 + 同硬件 + 同超参模式的条目
+        # 查找是否已有同方法 + 同硬件 + 同超参模式 + 同极性的条目
         existing = None
         for entry in entries:
             if (
                 entry.hardware_signature == hardware_signature
                 and entry.method_name == method_name
                 and entry.hyperparams_pattern == hyperparams_pattern
+                and entry.polarity == polarity
             ):
                 existing = entry
                 break
@@ -154,14 +200,40 @@ class KnowledgeBase:
                 aggregate_speedup=speedup_vs_parent,
                 confidence=0.2,
                 notes=notes,
+                polarity=polarity,
             )
             entries.append(new_entry)
 
         self._save_file(path, entries)
+        logger.info(
+            "KB %s entry: %s/%s on %s (speedup=%.3f, polarity=%s)",
+            "updated" if existing else "wrote new",
+            operator_class, method_name, hardware_signature,
+            speedup_vs_parent, polarity,
+        )
 
-    def write_global_entry(self, **kwargs) -> None:
-        """写入全局知识。"""
-        kwargs["operator_class"] = "_global"
-        self.write_entry(**kwargs)
-
-
+    def write_global_entry(
+        self,
+        hardware_signature: str,
+        method_name: str,
+        run_id: str,
+        version_id: str,
+        speedup_vs_parent: float,
+        operator_shape_signature: str = "",
+        hyperparams_pattern: dict | None = None,
+        notes: str = "",
+        polarity: str = "positive",
+    ) -> None:
+        """写入适用于任意算子的全局知识条目。"""
+        self.write_entry(
+            operator_class="_global",
+            hardware_signature=hardware_signature,
+            method_name=method_name,
+            run_id=run_id,
+            version_id=version_id,
+            speedup_vs_parent=speedup_vs_parent,
+            operator_shape_signature=operator_shape_signature,
+            hyperparams_pattern=hyperparams_pattern,
+            notes=notes,
+            polarity=polarity,
+        )

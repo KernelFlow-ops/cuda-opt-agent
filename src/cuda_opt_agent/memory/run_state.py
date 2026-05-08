@@ -1,9 +1,9 @@
 """
 RunStateManager —— 封装 RunState 的创建、修改、续跑逻辑。
 
-[修复]:
-  - should_stop 区分 correctness 失败和性能不够
-  - 连续 correctness 失败时给出更有信息量的终止原因
+[改进]:
+  - add_to_blacklist 支持 subspace / pattern_signature / regression_severity / trigger_conditions
+  - should_stop 强制只按 max_iterations 停止
 """
 
 from __future__ import annotations
@@ -52,6 +52,10 @@ class RunStateManager:
         logger.info("Created run: %s", self.run_dir)
         return self.state
 
+    def new_run(self, operator_spec: OperatorSpec) -> RunState:
+        """创建新运行；硬件信息稍后由 init 节点采集并回填。"""
+        return self.init_new_run(operator_spec, HardwareSpec())
+
     def resume_run(
         self, operator_name: str | None = None, run_dir: str | Path | None = None,
     ) -> RunState | None:
@@ -86,20 +90,39 @@ class RunStateManager:
         self._save()
 
     def add_to_blacklist(
-        self, method_name: str, reason: str,
+        self,
+        method_name: str,
+        reason: str,
         hp_constraint: dict | None = None,
         failed_at_version: str = "",
+        subspace: str | None = None,
+        pattern_signature: str | None = None,
+        regression_severity: str | None = None,
+        trigger_conditions: dict | None = None,
     ) -> None:
-        """将方法/超参添加到黑名单。"""
+        """
+        将方法/超参添加到黑名单。
+
+        [改进] 新增 subspace / pattern_signature / regression_severity / trigger_conditions
+        参数，支持子空间级黑名单匹配。
+        """
         assert self.state is not None
         entry = BlacklistEntry(
             method_name_normalized=normalize_method_name(method_name),
             hyperparam_constraint=hp_constraint,
             failed_at_version=failed_at_version,
             reason=reason,
+            subspace=subspace,
+            pattern_signature=pattern_signature,
+            regression_severity=regression_severity,
+            trigger_conditions=trigger_conditions,
         )
         self.state.blacklist.append(entry)
         self._save()
+        logger.info(
+            "Blacklisted: %s (subspace=%s, pattern=%s, severity=%s)",
+            entry.method_name_normalized, subspace, pattern_signature, regression_severity,
+        )
 
     def update_best(self, version_id: str, iter_dir: Path | None = None) -> None:
         """更新 current best。"""
@@ -125,9 +148,8 @@ class RunStateManager:
         """
         检查是否满足终止条件。
 
-        [修复] 区分 correctness 失败和性能不够:
-          - 连续 correctness 失败使用独立的计数和更有信息量的终止原因
-          - 连续 correctness 失败的阈值比一般 reject 更宽容 (给修复机制更多机会)
+        强制跑满 max_iterations；连续 reject、correctness 失败、catastrophic
+        regression、tiny kernel 等信号只作为后续 prompt 的上下文，不再触发早停。
 
         Returns:
             (should_stop, reason)
@@ -136,38 +158,8 @@ class RunStateManager:
         s = self.state
         c = self.config
 
-        # 1) 最大迭代
         if len(s.iterations) >= c.max_iterations:
             return True, f"Reached maximum iterations ({c.max_iterations})"
-
-        # 2) [修复] 区分 correctness 失败和一般的 reject
-        rejects = s.consecutive_rejects()
-
-        # 检查连续 correctness 失败
-        corr_fails = s.consecutive_correctness_failures()
-
-        if corr_fails >= c.consecutive_reject_limit:
-            # 连续 correctness 失败: 可能是系统性的代码生成问题
-            return True, (
-                f"Correctness failed {corr_fails} times consecutively. "
-                f"This indicates a systematic issue with code generation "
-                f"(e.g. incorrect algorithm logic, broken validation framework, "
-                f"or data type mismatch). Consider checking the v0 baseline "
-                f"correctness and the operator specification."
-            )
-
-        if rejects >= c.consecutive_reject_limit:
-            # 如果大部分是 correctness 失败, 给出不同的提示
-            if corr_fails > rejects // 2:
-                return True, (
-                    f"Rejected {rejects} times consecutively "
-                    f"({corr_fails} due to correctness failures). "
-                    f"The optimization approach may be introducing numerical errors."
-                )
-            return True, (
-                f"Rejected {rejects} times consecutively; "
-                f"likely stuck in a local optimum"
-            )
 
         return False, ""
 

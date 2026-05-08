@@ -29,6 +29,7 @@ from ._helpers import (
 from .analyze import analyze_node
 from .apply_direct import apply_direct_node
 from .bootstrap import bootstrap_node
+from .compare_library import compare_library_node  # [改进] 新增
 from .compile_validate import _repair_code, compile_and_validate_node
 from .decide import decide_node
 from .evaluate import evaluate_node
@@ -79,6 +80,7 @@ class AgentNodes:
 
     init_node = init_node
     bootstrap_node = bootstrap_node
+    compare_library_node = compare_library_node  # [改进] 新增
     compile_and_validate_node = compile_and_validate_node
     _repair_code = _repair_code
     profile_best_node = profile_best_node
@@ -92,5 +94,3 @@ class AgentNodes:
 
 
 __all__ = ["AgentNodes", "_compile_hp_candidate_job", "_iter_compile_hp_candidates_async", "GpuPool"]
-
-

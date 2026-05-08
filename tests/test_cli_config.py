@@ -21,6 +21,7 @@ CONFIG_ENV_KEYS = [
     "NCU_WARMUP_ROUNDS",
     "NCU_PROFILE_ROUNDS",
     "MULTI_SHAPE_AGGREGATOR",
+    "ENABLE_LIBRARY_COMPARISON",
 ]
 
 
@@ -148,6 +149,7 @@ def test_run_uses_env_defaults_when_cli_options_omitted(tmp_dir, monkeypatch):
             "NCU_LAUNCH_COUNT=5",
             "NCU_WARMUP_ROUNDS=2",
             "NCU_PROFILE_ROUNDS=3",
+            "ENABLE_LIBRARY_COMPARISON=false",
         ]),
         encoding="utf-8",
     )
@@ -166,6 +168,7 @@ def test_run_uses_env_defaults_when_cli_options_omitted(tmp_dir, monkeypatch):
     assert config.ncu_launch_count == 5
     assert config.ncu_warmup_rounds == 2
     assert config.ncu_profile_rounds == 3
+    assert config.enable_library_comparison is False
     assert set(op_spec.dtypes.values()) == {"bf16"}
     assert "Max iterations: 50" in result.output
     assert captured["stream_sink"] is SENTINEL_STREAM
@@ -291,6 +294,81 @@ def test_new_shape_profile_uses_operator_defaults(tmp_dir, monkeypatch):
 
     op_spec = captured["operator_spec"]
     assert op_spec.shape_profiles == [{"B": 1024, "N": 1024}, {"B": 4096, "N": 4096}]
+
+
+def test_new_layernorm_shapes_use_batch_hidden_keys(tmp_dir, monkeypatch):
+    clear_config_env(monkeypatch)
+
+    captured, _ = invoke_cli(
+        monkeypatch,
+        [
+            "new",
+            "layernorm",
+            "--task",
+            "fp16 layernorm",
+            "--shapes",
+            "1024^2;2048^2;4096^2",
+            "--env",
+            str(tmp_dir / "missing.env"),
+        ],
+    )
+
+    op_spec = captured["operator_spec"]
+    assert op_spec.shape_profiles == [
+        {"B": 1024, "N": 1024},
+        {"B": 2048, "N": 2048},
+        {"B": 4096, "N": 4096},
+    ]
+    assert op_spec.shapes == {"B": 1024, "N": 1024}
+
+
+def test_new_layernorm_shape_profile_uses_operator_defaults(tmp_dir, monkeypatch):
+    clear_config_env(monkeypatch)
+
+    captured, _ = invoke_cli(
+        monkeypatch,
+        [
+            "new",
+            "layernorm",
+            "--task",
+            "fp16 layernorm",
+            "--shape-profile",
+            "sweep",
+            "--env",
+            str(tmp_dir / "missing.env"),
+        ],
+    )
+
+    op_spec = captured["operator_spec"]
+    assert op_spec.shape_profiles == [
+        {"B": 1024, "N": 1024},
+        {"B": 2048, "N": 2048},
+        {"B": 4096, "N": 4096},
+    ]
+
+
+def test_list_uses_runs_dir_env_when_dir_omitted(tmp_dir, monkeypatch):
+    clear_config_env(monkeypatch)
+    runs_dir = tmp_dir / "configured_runs"
+    monkeypatch.setenv("RUNS_DIR", str(runs_dir))
+
+    from cuda_opt_agent.memory.persistence import PersistenceManager
+    from cuda_opt_agent.models.data import OperatorSpec, RunState
+
+    pm = PersistenceManager(str(runs_dir))
+    run_dir = pm.create_run_dir("layernorm")
+    pm.save_state(
+        RunState(
+            run_id=run_dir.name,
+            operator_spec=OperatorSpec(name="layernorm", signature="layernorm operation"),
+        ),
+        run_dir,
+    )
+
+    result = CliRunner().invoke(app, ["list"])
+
+    assert result.exit_code == 0, result.output
+    assert "layernorm_run_" in result.output
 
 
 def test_new_spec_mode_builds_operator_spec(tmp_dir, monkeypatch):

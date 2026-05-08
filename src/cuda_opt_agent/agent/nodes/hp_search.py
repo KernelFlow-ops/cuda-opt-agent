@@ -15,6 +15,10 @@ HP Search 节点 —— LLM 提出多组超参候选, 并发生成+编译+测速
   9. 智能代码截断, 保留 main() 校验框架
   10. 动态温度调节, 连续失败时降低随机性
   11. 向 LLM 注入近期 correctness 失败历史
+
+[改进]:
+  12. _prefilter_candidates: 在 tiny kernel 场景下预过滤明显有害的超参候选
+  13. propose_hp.md 注入 kernel_regime 信息和安全约束
 """
 
 from __future__ import annotations
@@ -65,7 +69,6 @@ def _smart_truncate_code(code: str, max_chars: int = 8000) -> str:
             break
 
     if main_start < 0:
-        # 找不到 main, 使用首尾各取一半的策略
         half = max_chars // 2
         return (
             code[:half]
@@ -74,9 +77,7 @@ def _smart_truncate_code(code: str, max_chars: int = 8000) -> str:
             + code[-half:]
         )
 
-    # kernel 代码 + main 函数都要保留
     main_section = code[main_start:]
-    # 为 kernel 部分留出空间
     remaining_for_kernel = max_chars - len(main_section) - 100
 
     if remaining_for_kernel > 500:
@@ -86,7 +87,6 @@ def _smart_truncate_code(code: str, max_chars: int = 8000) -> str:
             + main_section
         )
     else:
-        # main 太长, 至少保留 kernel 头部 + main 完整
         kernel_budget = max(500, max_chars // 3)
         main_budget = max_chars - kernel_budget - 100
         return (
@@ -151,30 +151,89 @@ def _count_consecutive_correctness_failures(run_state) -> int:
     return count
 
 
+# ════════════════════════════════════════
+# [改进] 预过滤明显有害的超参候选
+# ════════════════════════════════════════
+
+def _prefilter_candidates(
+    candidates: list[HyperparamCandidate],
+    baseline_lat_ms: float,
+    run_state: Any,
+) -> list[HyperparamCandidate]:
+    """
+    [改进] 在 tiny kernel 场景下预过滤明显会导致回归的超参候选。
+
+    当 baseline latency < 0.01 ms 时, 以下候选会被拦截:
+    - blocks_per_channel > 1 (multi-CTA per output, 必须跨 CTA 合并)
+    - threads_per_block < 64 (线程太少, 无法隐藏延迟)
+    - 需要多个 kernel launch 的配置
+    - 自声明 predicted_regression_risk = "high" 的候选
+
+    返回过滤后的列表; 至少保留 1 个候选 (保底)。
+    """
+    if baseline_lat_ms >= 0.01:
+        return candidates
+
+    logger.info(
+        "Prefiltering %d candidates for tiny kernel (baseline=%.4f ms)",
+        len(candidates), baseline_lat_ms,
+    )
+
+    filtered = []
+    dropped = []
+    for c in candidates:
+        hp = c.hyperparams or {}
+        reason = None
+
+        # 拦截已知的小 kernel 反模式
+        if hp.get("blocks_per_channel", 1) > 1:
+            reason = "blocks_per_channel > 1 on tiny kernel"
+        elif hp.get("threads_per_block", 256) < 64:
+            reason = "threads_per_block < 64 on tiny kernel"
+        elif hp.get("channels_per_block", 1) > 16 and hp.get("elements_per_thread", 4) <= 1:
+            reason = "high channels_per_block with low elements_per_thread"
+        elif hp.get("num_kernels", 1) > 1 or hp.get("kernel_count", 1) > 1:
+            reason = "multi-kernel launch on tiny kernel"
+        elif getattr(c, "predicted_regression_risk", "medium") == "high":
+            reason = "self-declared high regression risk"
+
+        if reason:
+            dropped.append((c.index, reason))
+            logger.info("Prefilter DROP candidate %d: %s", c.index, reason)
+        else:
+            filtered.append(c)
+
+    if not filtered:
+        # 至少保留一个: 取 risk 最低的
+        logger.warning("Prefilter dropped all candidates, keeping the least risky one")
+        candidates.sort(
+            key=lambda c: {"low": 0, "medium": 1, "high": 2}.get(
+                getattr(c, "predicted_regression_risk", "medium"), 1
+            )
+        )
+        filtered = [candidates[0]]
+
+    logger.info(
+        "Prefilter result: %d/%d candidates kept, %d dropped",
+        len(filtered), len(filtered) + len(dropped), len(dropped),
+    )
+    return filtered
+
+
 async def hp_search_node(self, state: dict) -> dict:
     """
     LLM 提出多组超参候选, 并发生成+编译+测速。
-
-    [优化] 核心改动:
-      - Phase 1: 并发 LLM 代码生成 (受 hp_llm_concurrency semaphore 限制)
-      - Phase 2: 异步编译 (基于 as_completed, 先完成先进入下阶段)
-      - Phase 3: 并行正确性校验 (跨 shape 并行)
-      - Phase 4: 多 GPU benchmark
-
-    [修复] 新增:
-      - 编译失败时触发修复循环 (对标 compile_validate._repair_code)
-      - correctness 失败时触发修复循环 (对标 compile_validate._repair_code)
-      - 收集所有候选的 correctness 失败详情
-      - 智能代码截断, 保留 main() 校验框架
-      - 动态温度调节
-      - 注入 correctness 失败历史上下文
     """
-    logger.info("=== HP SEARCH (optimized + correctness fix) ===")
+    logger.info("=== HP SEARCH (optimized + correctness fix + prefilter) ===")
     decision = state["method_decision"]
     hw = state["hardware_spec"]
     op = state["operator_spec"]
     ncu = state.get("current_ncu", NcuMetrics())
     run_state = state["run_state"]
+
+    # ── [改进] kernel regime 信息用于 propose_hp ──
+    kernel_regime = run_state.kernel_regime
+    regime_info = json.dumps(kernel_regime, ensure_ascii=False) if kernel_regime else "(未评估)"
 
     # ── Phase 0: LLM 提出超参候选 ──
     prompt = self.llm.format_prompt(
@@ -188,6 +247,7 @@ async def hp_search_node(self, state: dict) -> dict:
         ncu_key_metrics=format_ncu_for_prompt(ncu)[:3000],
         hardware_summary=self._hardware_summary(hw),
         hp_count=self.sm.config.hp_candidate_count,
+        kernel_regime_info=regime_info,
     )
 
     candidates_raw = await self.llm.ainvoke_json(
@@ -207,6 +267,10 @@ async def hp_search_node(self, state: dict) -> dict:
         logger.warning("No HP candidates produced by LLM")
         return _empty_result()
 
+    # ── [改进] 预过滤明显有害的候选 ──
+    best_lat = run_state.best_latency_ms() or 0.0
+    candidates = _prefilter_candidates(candidates, best_lat, run_state)
+
     version_base = run_state.next_version_id(has_hp=True)
 
     # [优化] 初始化 GPU 池
@@ -219,7 +283,6 @@ async def hp_search_node(self, state: dict) -> dict:
         from ._helpers import _build_code_diff_context
         ctx = _build_code_diff_context(best_code)
         if ctx["mode"] == "skeleton":
-            # 使用智能截断代替简单的 skeleton
             code_for_prompt = _smart_truncate_code(best_code, max_chars=8000)
         else:
             code_for_prompt = ctx["code"]
@@ -268,7 +331,7 @@ async def hp_search_node(self, state: dict) -> dict:
 
             response = await self.llm.ainvoke(
                 apply_prompt,
-                temperature=effective_temp,  # [修复] 使用动态温度
+                temperature=effective_temp,
                 node_name=f"hp_search:cand{cand.index}",
             )
             code = extract_cuda_code(response)
@@ -305,7 +368,6 @@ async def hp_search_node(self, state: dict) -> dict:
             "code_path": str(code_path),
             "output_path": str(iter_dir / "kernel"),
             "compute_capability": hw.compute_capability,
-            # [优化] 传递 nvcc_threads 和 gpu_id
             "nvcc_threads": self.sm.config.nvcc_parallel_threads,
             "gpu_id": gpu_pool.assign_gpu(cand.index),
         })
@@ -329,15 +391,7 @@ async def hp_search_node(self, state: dict) -> dict:
     )
 
     async def _validate_and_benchmark(compiled: dict) -> dict[str, Any] | None:
-        """
-        单个候选的校验+benchmark流水线。
-
-        [修复] 当 correctness 失败时, 触发修复循环:
-          1. 收集详细的 correctness 错误信息
-          2. 调用 _repair_code 让 LLM 修复
-          3. 重新编译+校验
-          4. 最多重试 hp_correctness_repair_max 次
-        """
+        """单个候选的校验+benchmark流水线。"""
         version_id = compiled["version_id"]
         if version_id not in candidate_records:
             return None
@@ -451,7 +505,6 @@ async def hp_search_node(self, state: dict) -> dict:
         accumulated_errors: list[str] = []
 
         for repair_attempt in range(hp_correctness_repair_max + 1):
-            # [优化] 跨 shape 并行正确性校验
             shape_profiles = self._active_shape_profiles(op)
             if len(shape_profiles) <= 1 or max_correctness_parallel <= 1:
                 try:
@@ -564,11 +617,10 @@ async def hp_search_node(self, state: dict) -> dict:
                     accumulated_errors.append(
                         f"[Compile after repair {repair_attempt + 1}]: {new_cr.stderr[:500]}"
                     )
-                    # 编译失败继续下一轮修复尝试 (而不是直接放弃)
                     continue
 
                 exe_path = Path(new_cr.output_path)
-                record["code"] = current_code  # 更新为修复后的代码
+                record["code"] = current_code
             else:
                 # 修复次数用尽, 收集失败详情
                 correctness_failure_details.append({
@@ -592,8 +644,6 @@ async def hp_search_node(self, state: dict) -> dict:
                 )
                 return None
         else:
-            # for-else: 如果没有 break (即最后一轮修复后校验仍然失败)
-            # 这种情况在 break 分支外已处理, 这里是安全兜底
             correctness_failure_details.append({
                 "candidate_index": cand.index,
                 "hyperparams": cand.hyperparams,
@@ -603,8 +653,7 @@ async def hp_search_node(self, state: dict) -> dict:
             })
             return None
 
-        # 如果候选经历过编译或 correctness 修复, 将最终可执行文件和代码落回
-        # 标准路径。后续 profile_best 只会读取 iter*/kernel 和 iter*/code.cu。
+        # 如果候选经历过修复, 将最终文件落回标准路径
         await asyncio.to_thread(
             self.sm.persistence.save_code,
             current_code,
@@ -615,7 +664,7 @@ async def hp_search_node(self, state: dict) -> dict:
             await asyncio.to_thread(shutil.copy2, exe_path, canonical_exe)
         exe_path = canonical_exe
 
-        # [优化] 多 GPU benchmark (通过 GPU semaphore 避免竞争)
+        # [优化] 多 GPU benchmark
         gpu_sem = gpu_pool.get_semaphore(assigned_gpu)
         async with gpu_sem:
             try:
@@ -658,7 +707,6 @@ async def hp_search_node(self, state: dict) -> dict:
                 results.append(r)
 
     if not results:
-        # [修复] 返回包含 correctness 失败详情的结果
         return _empty_result_with_details(correctness_failure_details)
 
     best_cand = min(results, key=lambda r: r["benchmark"].latency_ms_median)
@@ -671,7 +719,6 @@ async def hp_search_node(self, state: dict) -> dict:
         "trial_compile_ok": True,
         "trial_correctness_ok": True,
         "hp_candidates": results,
-        # [修复] 即使部分成功, 也传递失败详情供 reflect 分析
         "hp_correctness_failures": correctness_failure_details,
         "hp_all_compiled_ok": True,
     }
@@ -696,13 +743,7 @@ def _empty_result() -> dict:
 def _empty_result_with_details(
     correctness_failures: list[dict[str, Any]] | None = None,
 ) -> dict:
-    """
-    [修复] 返回包含 correctness 失败详情的空结果。
-
-    关键区别:
-      - hp_all_compiled_ok=True 表示编译成功但 correctness 失败
-      - hp_correctness_failures 包含每个候选的详细错误信息
-    """
+    """[修复] 返回包含 correctness 失败详情的空结果。"""
     has_compiled_candidates = bool(correctness_failures)
     return {
         "new_code": "",
@@ -713,7 +754,6 @@ def _empty_result_with_details(
         "trial_correctness_ok": False,
         "trial_accepted": False,
         "hp_candidates": [],
-        # [修复] 传递 correctness 失败详情
         "hp_correctness_failures": correctness_failures or [],
         "hp_all_compiled_ok": has_compiled_candidates,
     }

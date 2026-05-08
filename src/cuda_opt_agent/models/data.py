@@ -8,6 +8,13 @@
   - AgentConfig.nvcc_parallel_threads: nvcc -t N
   - AgentConfig.hp_llm_concurrency: hp_search LLM 并发数
   - AgentConfig.use_code_diff: 代码 diff 模式
+
+[改进] 新增字段:
+  - BlacklistEntry.subspace / pattern_signature: 子空间级黑名单
+  - MethodDecision.subspace / differentiation_from_failed / falsification_condition / meta_decision / give_up_reason_type
+  - RunState.kernel_regime: 首次分析后缓存的 regime 信息
+  - AgentConfig.launch_floor_ms / catastrophic_regression_threshold
+  - HyperparamCandidate.predicted_regression_risk / risk_rationale
 """
 
 from __future__ import annotations
@@ -32,6 +39,7 @@ class RunStatus(str, Enum):
 class NodeName(str, Enum):
     INIT = "init"
     BOOTSTRAP = "bootstrap"
+    COMPARE_LIBRARY = "compare_library"  # [改进] 新增
     PROFILE_BEST = "profile_best"
     ANALYZE = "analyze"
     DECIDE = "decide"
@@ -145,18 +153,45 @@ class IterationRecord(BaseModel):
 # 黑名单
 # ────────────────────────────────────────────
 class BlacklistEntry(BaseModel):
-    """已失败的 (方法+超参约束) 记录。"""
+    """已失败的 (方法+超参约束) 记录。
+
+    [改进] 新增 subspace 和 pattern_signature 字段，
+    支持子空间级黑名单匹配，防止 LLM 换名绕过。
+    """
     method_name_normalized: str
     hyperparam_constraint: dict[str, Any] | None = None
     failed_at_version: str = ""
     reason: str = ""
+    # [改进] 子空间级黑名单
+    subspace: str | None = None
+    pattern_signature: str | None = None
+    regression_severity: str | None = None  # catastrophic / severe / mild / correctness
+    trigger_conditions: dict[str, Any] | None = None
 
 
 # ────────────────────────────────────────────
 # LLM 决策
 # ────────────────────────────────────────────
+class MetaDecision(BaseModel):
+    """[改进] 元决策: 先决定是否继续优化。"""
+    should_continue: bool = True
+    reasons: list[str] = Field(default_factory=list)
+    regression_streak: int = 0
+    exhausted_subspaces: list[str] = Field(default_factory=list)
+    remaining_promising_subspaces: list[str] = Field(default_factory=list)
+    near_library_baseline: bool = False
+
+
 class MethodDecision(BaseModel):
-    """LLM 在 decide 节点产出的结构化决策。"""
+    """LLM 在 decide 节点产出的结构化决策。
+
+    [改进] 新增:
+      - meta_decision: 元决策信息
+      - subspace: 所属优化子空间
+      - differentiation_from_failed: 与已失败方法的差异论述
+      - falsification_condition: 否证条件
+      - give_up_reason_type: 放弃原因分类
+    """
     method_name: str
     has_hyperparams: bool = False
     hyperparams_schema: dict[str, Any] | None = None
@@ -164,13 +199,24 @@ class MethodDecision(BaseModel):
     expected_impact: str = "medium"       # high / medium / low + 说明
     confidence: float = 0.5               # 0~1
     give_up: bool = False                 # LLM 认为没招了
+    # [改进] 新增字段
+    meta_decision: MetaDecision | None = None
+    subspace: str | None = None
+    differentiation_from_failed: str = ""
+    falsification_condition: str = ""
+    give_up_reason_type: str | None = None  # optimal_reached / exhausted_search / catastrophic_streak / near_library_baseline
 
 
 class HyperparamCandidate(BaseModel):
-    """一组超参候选。"""
+    """一组超参候选。
+
+    [改进] 新增 predicted_regression_risk 和 risk_rationale。
+    """
     index: int
     hyperparams: dict[str, Any]
     rationale: str = ""
+    predicted_regression_risk: str = "medium"  # low / medium / high
+    risk_rationale: str = ""
 
 
 # ────────────────────────────────────────────
@@ -229,6 +275,28 @@ class AgentConfig(BaseModel):
         description="HP 候选 correctness 失败时的最大修复尝试次数 (0=不修复, 直接丢弃)",
     )
 
+    # ── [改进] 新增配置 ──
+    launch_floor_ms: float = Field(
+        default=0.005,
+        description="估计的 kernel launch overhead floor (ms), 用于判断 tiny kernel regime",
+    )
+    catastrophic_regression_threshold: float = Field(
+        default=3.0,
+        description="回归倍数 >= 该值视为 catastrophic regression",
+    )
+    catastrophic_streak_limit: int = Field(
+        default=2,
+        description="连续 catastrophic regression 的提示阈值; 强制跑满模式下不触发早停",
+    )
+    tiny_kernel_reject_limit: int = Field(
+        default=3,
+        description="tiny kernel 下连续 reject 的提示阈值; 强制跑满模式下不触发早停",
+    )
+    enable_library_comparison: bool = Field(
+        default=True,
+        description="是否在 bootstrap 后执行 cuDNN/cuBLAS 基线对比",
+    )
+
 
 # ────────────────────────────────────────────
 # 运行状态（续跑核心）
@@ -245,6 +313,15 @@ class RunState(BaseModel):
     created_at: str = Field(default_factory=lambda: _now_iso())
     updated_at: str = Field(default_factory=lambda: _now_iso())
     config: AgentConfig = Field(default_factory=AgentConfig)
+    # [改进] 新增
+    kernel_regime: dict[str, Any] = Field(
+        default_factory=dict,
+        description="首次 analyze 后缓存的 regime 信息 (regime, near_launch_floor 等)",
+    )
+    library_baseline_ms: float | None = Field(
+        default=None,
+        description="cuDNN/cuBLAS 等价实现的 latency (ms), 若有",
+    )
 
     # ── 便捷方法 ──
     def iter_by_id(self, version_id: str) -> IterationRecord | None:
@@ -279,6 +356,34 @@ class RunState(BaseModel):
                 break
         return count
 
+    def best_latency_ms(self) -> float | None:
+        """[改进] 获取当前 best 的 latency。"""
+        best = self.iter_by_id(self.current_best_id)
+        if best and best.benchmark:
+            return best.benchmark.latency_ms_median
+        return None
+
+    def catastrophic_regression_streak(self, threshold: float = 3.0) -> int:
+        """[改进] 统计尾部连续 catastrophic regression 次数。"""
+        best_lat = self.best_latency_ms()
+        if not best_lat or best_lat <= 0:
+            return 0
+        count = 0
+        for it in reversed(self.iterations):
+            if it.version_id == self.current_best_id or it.version_id == "v0":
+                break
+            if it.benchmark and it.benchmark.latency_ms_median > 0:
+                ratio = it.benchmark.latency_ms_median / best_lat
+                if ratio >= threshold:
+                    count += 1
+                else:
+                    break
+            elif not it.compile_ok or not it.correctness_ok:
+                count += 1  # 编译/正确性失败也算入 streak
+            else:
+                break
+        return count
+
     def next_version_id(self, has_hp: bool = False) -> str:
         idx = len(self.iterations)
         suffix = "_hp" if has_hp else ""
@@ -294,6 +399,21 @@ class RunState(BaseModel):
                 if entry.hyperparam_constraint == hp_constraint:
                     return True
         return False
+
+    def is_subspace_blacklisted(self, subspace: str | None) -> tuple[bool, str]:
+        """[改进] 检查某个子空间是否已有 ≥ 2 次失败（视为穷尽）。"""
+        if not subspace:
+            return False, ""
+        from .enums import subspaces_overlap
+        failure_count = 0
+        reasons = []
+        for entry in self.blacklist:
+            if subspaces_overlap(entry.subspace, subspace):
+                failure_count += 1
+                reasons.append(f"{entry.method_name_normalized}({entry.subspace})")
+        if failure_count >= 2:
+            return True, f"subspace '{subspace}' has {failure_count} failures: {', '.join(reasons)}"
+        return False, ""
 
     def touch(self) -> None:
         self.updated_at = _now_iso()
@@ -320,6 +440,8 @@ class KnowledgeEntry(BaseModel):
     confidence: float = 0.0
     notes: str = ""
     last_updated: str = Field(default_factory=lambda: _now_iso())
+    # [改进] 新增
+    polarity: str = "positive"  # positive / negative
 
 
 # ────────────────────────────────────────────
@@ -327,5 +449,3 @@ class KnowledgeEntry(BaseModel):
 # ────────────────────────────────────────────
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-

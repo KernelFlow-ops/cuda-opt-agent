@@ -40,6 +40,26 @@ class TestWidgets:
         console = Console(file=StringIO())
         console.print(panel)
 
+    def test_dashboard_shape_summary_ignores_profile_weight(self):
+        from cuda_opt_agent.models.data import RunState, OperatorSpec, AgentConfig
+        from cuda_opt_agent.tui.widgets import build_dashboard_panel
+
+        state = RunState(
+            run_id="weighted",
+            operator_spec=OperatorSpec(
+                name="layernorm",
+                signature="y[B,N] = layernorm(x[B,N])",
+                dtypes={"input": "fp16", "output": "fp16"},
+                shape_profiles=[{"B": 512, "N": 1024, "weight": 0.2}],
+            ),
+            config=AgentConfig(),
+        )
+
+        panel = build_dashboard_panel(state)
+
+        assert "B=512,N=1024" in str(panel.renderable)
+        assert "0.2" not in str(panel.renderable)
+
 
 class TestLiveStream:
     def test_create(self):

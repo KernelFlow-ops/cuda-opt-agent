@@ -12,6 +12,7 @@ from rich.table import Table
 from rich.text import Text
 
 from ..models.data import IterationRecord, RunState
+from ..shape_profiles import shape_profile_label
 
 
 def _per_shape_summary(iteration: IterationRecord, limit: int = 2) -> str:
@@ -30,6 +31,15 @@ def _per_shape_summary(iteration: IterationRecord, limit: int = 2) -> str:
     return " ".join(parts)
 
 
+def _shape_summary(state: RunState) -> str:
+    op = state.operator_spec
+    if op.shape_profiles:
+        return shape_profile_label(op.shape_profiles[0])
+    if op.shapes:
+        return shape_profile_label(op.shapes)
+    return "default"
+
+
 def build_dashboard_panel(state: RunState) -> Panel:
     """构建主控面板。"""
     op = state.operator_spec
@@ -37,7 +47,7 @@ def build_dashboard_panel(state: RunState) -> Panel:
 
     # 基础信息
     info_lines = [
-        f"Operator: {op.name}  {list(op.dtypes.values())}  {list(op.shapes.values())}",
+        f"Operator: {op.name}  {list(op.dtypes.values())}  {_shape_summary(state)}",
         f"Hardware: {hw.gpu_name}  {hw.compute_capability}  CUDA {hw.cuda_version}",
         f"Run:      {state.run_id}   [Iter {len(state.iterations)}/{state.config.max_iterations}]",
     ]
@@ -127,5 +137,3 @@ def build_progress_bar(state: RunState) -> Progress:
     current = len(state.iterations)
     task = progress.add_task("Optimization Progress", total=total, completed=current)
     return progress
-
-

@@ -28,11 +28,22 @@ DEFAULT_PROFILES: dict[str, dict[str, list[ShapeProfile]]] = {
             {"B": 4096, "N": 4096},
         ],
     },
+    "layernorm": {
+        "small": [{"B": 1024, "N": 1024}],
+        "medium": [{"B": 2048, "N": 2048}],
+        "large": [{"B": 4096, "N": 4096}],
+        "sweep": [
+            {"B": 1024, "N": 1024},
+            {"B": 2048, "N": 2048},
+            {"B": 4096, "N": 4096},
+        ],
+    },
 }
 
 OPERATOR_DIM_KEYS = {
     "gemm": ["M", "N", "K"],
     "softmax": ["B", "N"],
+    "layernorm": ["B", "N"],
 }
 
 
@@ -134,5 +145,3 @@ def profile_weight(profile: ShapeProfile) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 1.0
-
-

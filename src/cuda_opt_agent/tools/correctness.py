@@ -303,5 +303,3 @@ def save_correctness_result(result: CorrectnessResult, output_path: str | Path) 
         "message": result.message,
     }
     output_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-
-

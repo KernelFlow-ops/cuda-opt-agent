@@ -208,5 +208,3 @@ class PersistenceManager:
 
         logger.error("Could not recover state: %s", run_dir)
         return None
-
-

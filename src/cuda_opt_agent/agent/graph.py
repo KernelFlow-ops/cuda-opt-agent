@@ -1,13 +1,36 @@
 """
 LangGraph 状态机 —— 编排整个迭代优化流程。
 对应技术总纲 §2.3 的状态图。
+
+[改进]:
+  - 新增 compare_library 节点: bootstrap 后可选地对比 cuDNN/cuBLAS 基线
+  - 状态转移:
+      [*] → init → bootstrap → compile_validate → compare_library → profile_best → analyze
+      analyze → decide
+      decide → hp_search (含超参) / apply_direct (无超参) / terminate (max_iterations)
+      hp_search → evaluate
+      apply_direct → evaluate
+      evaluate → reflect
+      reflect → terminate (满足停止条件) / profile_best (继续)
+      terminate → [*]
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import warnings
 from typing import Any
+
+from langchain_core._api.deprecation import LangChainPendingDeprecationWarning
+
+# LangGraph currently instantiates langchain-core's Reviver without
+# allowed_objects during import. Keep CLI output clean while upstream catches up.
+warnings.filterwarnings(
+    "ignore",
+    message=r"The default value of `allowed_objects` will change in a future version\.",
+    category=LangChainPendingDeprecationWarning,
+)
 
 from langgraph.graph import END, StateGraph
 
@@ -33,15 +56,7 @@ def build_graph(
     """
     构建 LangGraph 状态机。
 
-    状态转移:
-        [*] → init → bootstrap → compile_validate → profile_best → analyze
-        analyze → decide
-        decide → hp_search (含超参) / apply_direct (无超参)
-        hp_search → evaluate
-        apply_direct → evaluate
-        evaluate → reflect
-        reflect → terminate (满足停止条件) / profile_best (继续)
-        terminate → [*]
+    [改进] 新增 compare_library 节点。
     """
     if config is None:
         config = load_config()
@@ -66,6 +81,7 @@ def build_graph(
     graph.add_node("init", nodes.init_node)
     graph.add_node("bootstrap", nodes.bootstrap_node)
     graph.add_node("compile_validate", nodes.compile_and_validate_node)
+    graph.add_node("compare_library", nodes.compare_library_node)  # [改进] 新增
     graph.add_node("profile_best", nodes.profile_best_node)
     graph.add_node("analyze", nodes.analyze_node)
     graph.add_node("decide", nodes.decide_node)
@@ -80,17 +96,21 @@ def build_graph(
     graph.add_edge("init", "bootstrap")
     graph.add_edge("bootstrap", "compile_validate")
 
-    # compile_validate → profile_best (如果成功) 或 terminate (失败)
+    # compile_validate → compare_library (如果成功) 或 terminate (失败)
+    # [改进] 编译成功后先走 compare_library 再 profile
     graph.add_conditional_edges(
         "compile_validate",
         _route_after_compile,
-        {"profile_best": "profile_best", "terminate": "terminate"},
+        {"compare_library": "compare_library", "terminate": "terminate"},
     )
+
+    # compare_library → profile_best (总是继续, library comparison 是非阻塞的)
+    graph.add_edge("compare_library", "profile_best")
 
     graph.add_edge("profile_best", "analyze")
     graph.add_edge("analyze", "decide")
 
-    # decide → hp_search / apply_direct / terminate (give_up)
+    # decide → hp_search / apply_direct / terminate (max_iterations)
     graph.add_conditional_edges(
         "decide",
         _route_after_decide,
@@ -114,9 +134,12 @@ def build_graph(
 
 
 def _route_after_compile(state: GraphState) -> str:
-    """编译成功 → profile; 失败 → terminate。"""
+    """编译成功 → compare_library; 失败 → terminate。
+
+    [改进] 改为先走 compare_library 再 profile。
+    """
     if state.get("trial_compile_ok") and state.get("trial_correctness_ok"):
-        return "profile_best"
+        return "compare_library"
     return "terminate"
 
 
@@ -186,13 +209,12 @@ async def run_optimization_async(
     if resume_dir:
         run_state = state_manager.resume_run(run_dir=resume_dir)
         if run_state is None:
-            raise RuntimeError(f"Could not resume from {resume_dir}")
+            raise FileNotFoundError(f"Cannot resume from {resume_dir}")
+        entry_point = _infer_resume_entry_point(run_state)
     else:
-        from ..tools.hardware import collect_hardware_info
-        hw = await asyncio.to_thread(collect_hardware_info)
-        run_state = await asyncio.to_thread(state_manager.init_new_run, operator_spec, hw)
+        run_state = state_manager.new_run(operator_spec)
+        entry_point = "init"
 
-    entry_point = "profile_best" if resume_dir and run_state.iterations else "init"
     graph = build_graph(
         config=config,
         state_manager=state_manager,
@@ -201,12 +223,11 @@ async def run_optimization_async(
         entry_point=entry_point,
         stream_sink=stream_sink,
     )
+
     compiled = graph.compile()
 
     active_operator_spec = run_state.operator_spec if resume_dir else operator_spec
-
-    # 初始状态
-    initial_state: GraphState = {
+    initial_state: dict[str, Any] = {
         "operator_spec": active_operator_spec,
         "hardware_spec": run_state.hardware_spec,
         "run_state": run_state,
@@ -214,23 +235,17 @@ async def run_optimization_async(
         "iteration_count": len(run_state.iterations),
     }
 
-    # 如果是续跑且已有迭代,直接从 profile_best 继续。
-    if run_state.iterations:
-        logger.info("Resume mode: skipping bootstrap and starting from profile_best")
+    final_state = await compiled.ainvoke(initial_state)
 
-    # 运行
-    try:
-        final_state = await compiled.ainvoke(initial_state)
-        return state_manager.state
-    except KeyboardInterrupt:
-        logger.info("Interrupted by user (Ctrl+C); saving state...")
-        if state_manager.state:
-            state_manager.state.status = RunStatus.PAUSED
-            await asyncio.to_thread(state_manager._save)
-        return state_manager.state
-    except Exception as e:
-        logger.error("Run failed with exception: %s", e, exc_info=True)
-        await asyncio.to_thread(state_manager.mark_failed)
-        raise
+    state_manager.mark_done()
+    return state_manager.state
 
 
+def _infer_resume_entry_point(run_state: RunState) -> str:
+    """从 RunState 推断续跑入口点。"""
+    if not run_state.iterations:
+        return "init"
+    last = run_state.iterations[-1]
+    if last.accepted and last.version_id == run_state.current_best_id:
+        return "profile_best"
+    return "profile_best"

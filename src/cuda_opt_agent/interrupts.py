@@ -41,5 +41,3 @@ def _handle_sigint(signum: int, frame: FrameType | None) -> None:
 def _reset_interrupt_state_for_tests() -> None:
     global _last_sigint_at
     _last_sigint_at = 0.0
-
-

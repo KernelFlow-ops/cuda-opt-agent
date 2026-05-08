@@ -249,5 +249,3 @@ def _benchmark_result_from_dict(data: dict) -> BenchmarkResult:
         throughput_gflops=data.get("throughput_gflops"),
         extra={"latencies_count": len(latencies), "min_ms": sorted_lat[0], "max_ms": sorted_lat[-1]},
     )
-
-

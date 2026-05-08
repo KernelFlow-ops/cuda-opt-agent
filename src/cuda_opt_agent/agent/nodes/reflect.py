@@ -5,6 +5,12 @@
   - 区分 3 种失败类型: 编译失败 / correctness 失败 / 性能不够
   - 传递 correctness 失败的详细数值误差信息给 LLM
   - 让 LLM 能够针对具体的数值错误进行有效反思
+
+[改进]:
+  - 失败时也写入 KB (negative polarity),让跨 run 学习失败教训
+  - 传递 regression_ratio 和 kernel_regime 给 reflect prompt
+  - 从 reflection 中提取 anti_pattern 结构化信息,存入 blacklist
+  - 从 reflection 中提取 subspace,用于子空间级黑名单
 """
 
 from __future__ import annotations
@@ -13,6 +19,7 @@ import json
 import logging
 
 from ...models.data import BenchmarkResult, IterationRecord, MethodDecision
+from ...models.enums import infer_subspace_from_method_name
 from ..temperatures import TEMP_REFLECT
 
 logger = logging.getLogger(__name__)
@@ -66,6 +73,15 @@ async def reflect_node(self, state: dict) -> dict:
             best_bm=best_bm,
         )
 
+        # ── [改进] 计算回归倍数 ──
+        regression_ratio = 0.0
+        if trial_bm.latency_ms_median > 0 and best_bm.latency_ms_median > 0:
+            regression_ratio = trial_bm.latency_ms_median / best_bm.latency_ms_median
+
+        # ── [改进] kernel regime 信息 ──
+        kernel_regime = run_state.kernel_regime
+        regime_text = json.dumps(kernel_regime, ensure_ascii=False) if kernel_regime else "(未评估)"
+
         prompt = self.llm.format_prompt(
             "reflect_failure.md",
             method_name=decision.method_name,
@@ -74,9 +90,11 @@ async def reflect_node(self, state: dict) -> dict:
             best_latency_ms=best_bm.latency_ms_median,
             trial_id=version_id,
             trial_latency_ms=trial_bm.latency_ms_median if trial_bm.latency_ms_median > 0 else "N/A",
+            regression_ratio=f"{regression_ratio:.2f}" if regression_ratio > 0 else "N/A",
             failure_reason=failure_reason,
             correctness_failure_detail=correctness_failure_detail,
             ncu_report="(see ncu report)",
+            kernel_regime=regime_text,
         )
 
     reflection = await self.llm.ainvoke_json(prompt, temperature=TEMP_REFLECT, node_name="reflect")
@@ -117,14 +135,67 @@ async def reflect_node(self, state: dict) -> dict:
                 version_id=version_id,
                 speedup_vs_parent=speedup,
                 notes=kb_suggestion.get("notes", ""),
+                polarity="positive",
             )
     else:
+        # ── [改进] 从 reflection 提取 anti_pattern 的子空间和签名 ──
+        anti_pattern = reflection.get("anti_pattern", {})
+        subspace = anti_pattern.get("subspace") or getattr(decision, "subspace", None)
+        if not subspace:
+            subspace = infer_subspace_from_method_name(decision.method_name)
+        pattern_signature = anti_pattern.get("pattern_signature")
+        regression_severity = reflection.get("regression_severity")
+        trigger_conditions = anti_pattern.get("trigger_conditions")
+
         self.sm.add_to_blacklist(
             method_name=decision.method_name,
             reason=reflection.get("why_ineffective", "unknown"),
             hp_constraint=selected_hyperparams if decision.has_hyperparams else None,
             failed_at_version=version_id,
+            subspace=subspace,
+            pattern_signature=pattern_signature,
+            regression_severity=regression_severity,
+            trigger_conditions=trigger_conditions,
         )
+
+        # ── [改进] 失败教训也写入 KB (negative polarity) ──
+        kb_suggestion = reflection.get("kb_write_suggestion", {})
+        if kb_suggestion.get("should_write", False):
+            regression_ratio_val = 0.0
+            if trial_bm.latency_ms_median > 0 and best_bm.latency_ms_median > 0:
+                regression_ratio_val = trial_bm.latency_ms_median / best_bm.latency_ms_median
+
+            # speedup < 1.0 表示负面（回归）
+            speedup_for_kb = (
+                1.0 / regression_ratio_val
+                if regression_ratio_val > 0
+                else 0.5
+            )
+
+            anti_pattern_str = json.dumps(anti_pattern, ensure_ascii=False) if anti_pattern else ""
+            notes = (
+                f"[NEGATIVE] {kb_suggestion.get('notes', '')} | "
+                f"anti_pattern={anti_pattern_str} | "
+                f"regression={regression_ratio_val:.2f}x | "
+                f"severity={regression_severity}"
+            )
+
+            polarity = kb_suggestion.get("polarity", "negative")
+            self.kb.write_entry(
+                operator_class=op.name,
+                hardware_signature=hw.signature,
+                method_name=decision.method_name,
+                run_id=run_state.run_id,
+                version_id=version_id,
+                speedup_vs_parent=speedup_for_kb,
+                hyperparams_pattern=selected_hyperparams,
+                notes=notes,
+                polarity=polarity,
+            )
+            logger.info(
+                "Wrote negative KB entry for %s: regression=%.2fx, subspace=%s",
+                decision.method_name, regression_ratio_val, subspace,
+            )
 
     if self.sm.run_dir:
         reasoning_text = (
