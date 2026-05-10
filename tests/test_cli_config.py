@@ -22,6 +22,15 @@ CONFIG_ENV_KEYS = [
     "NCU_PROFILE_ROUNDS",
     "MULTI_SHAPE_AGGREGATOR",
     "ENABLE_LIBRARY_COMPARISON",
+    "ENABLE_WEB_SEARCH_BASELINE",
+    "BOOTSTRAP_WEB_SEARCH_MAX_CALLS",
+    "BOOTSTRAP_WEB_SEARCH_MAX_RESULTS",
+    "BOOTSTRAP_WEB_SEARCH_PER_QUERY_RESULTS",
+    "WEB_SEARCH_ON_FAILURE_THRESHOLD",
+    "LAUNCH_FLOOR_MS",
+    "CATASTROPHIC_REGRESSION_THRESHOLD",
+    "CATASTROPHIC_STREAK_LIMIT",
+    "TINY_KERNEL_REJECT_LIMIT",
 ]
 
 
@@ -150,6 +159,15 @@ def test_run_uses_env_defaults_when_cli_options_omitted(tmp_dir, monkeypatch):
             "NCU_WARMUP_ROUNDS=2",
             "NCU_PROFILE_ROUNDS=3",
             "ENABLE_LIBRARY_COMPARISON=false",
+            "ENABLE_WEB_SEARCH_BASELINE=false",
+            "BOOTSTRAP_WEB_SEARCH_MAX_CALLS=11",
+            "BOOTSTRAP_WEB_SEARCH_MAX_RESULTS=9",
+            "BOOTSTRAP_WEB_SEARCH_PER_QUERY_RESULTS=4",
+            "WEB_SEARCH_ON_FAILURE_THRESHOLD=4",
+            "LAUNCH_FLOOR_MS=0.02",
+            "CATASTROPHIC_REGRESSION_THRESHOLD=4.5",
+            "CATASTROPHIC_STREAK_LIMIT=6",
+            "TINY_KERNEL_REJECT_LIMIT=7",
         ]),
         encoding="utf-8",
     )
@@ -169,6 +187,15 @@ def test_run_uses_env_defaults_when_cli_options_omitted(tmp_dir, monkeypatch):
     assert config.ncu_warmup_rounds == 2
     assert config.ncu_profile_rounds == 3
     assert config.enable_library_comparison is False
+    assert config.enable_web_search_baseline is False
+    assert config.bootstrap_web_search_max_calls == 11
+    assert config.bootstrap_web_search_max_results == 9
+    assert config.bootstrap_web_search_per_query_results == 4
+    assert config.web_search_on_failure_threshold == 4
+    assert config.launch_floor_ms == pytest.approx(0.02)
+    assert config.catastrophic_regression_threshold == pytest.approx(4.5)
+    assert config.catastrophic_streak_limit == 6
+    assert config.tiny_kernel_reject_limit == 7
     assert set(op_spec.dtypes.values()) == {"bf16"}
     assert "Max iterations: 50" in result.output
     assert captured["stream_sink"] is SENTINEL_STREAM

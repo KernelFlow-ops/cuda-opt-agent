@@ -132,6 +132,14 @@ class RunStateManager:
             self.persistence.update_best_symlink(self.run_dir, iter_dir)
         self._save()
 
+    def update_kernel_regime(self, regime: dict) -> None:
+        """Persist the latest latency regime classification."""
+        assert self.state is not None
+        self.state.kernel_regime = regime
+        self.state.touch()
+        self._save()
+        logger.info("Kernel regime updated: %s", regime)
+
     def mark_done(self) -> None:
         """标记运行完成。"""
         assert self.state is not None

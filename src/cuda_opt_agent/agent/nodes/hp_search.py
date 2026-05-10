@@ -39,6 +39,7 @@ from ...tools.correctness import (
     summarize_correctness_results,
 )
 from ...tools.profile import format_ncu_for_prompt
+from ...tools.ref_eval import run_ref_benchmark_multi, run_ref_correctness_multi
 from ..temperatures import TEMP_APPLY_METHOD, TEMP_PROPOSE_HP
 from ._helpers import GpuPool, _compile_hp_candidates_async, _iter_compile_hp_candidates_async
 
@@ -159,11 +160,12 @@ def _prefilter_candidates(
     candidates: list[HyperparamCandidate],
     baseline_lat_ms: float,
     run_state: Any,
+    config: Any | None = None,
 ) -> list[HyperparamCandidate]:
     """
     [改进] 在 tiny kernel 场景下预过滤明显会导致回归的超参候选。
 
-    当 baseline latency < 0.01 ms 时, 以下候选会被拦截:
+    当 baseline latency 接近配置的 launch floor 时, 以下候选会被拦截:
     - blocks_per_channel > 1 (multi-CTA per output, 必须跨 CTA 合并)
     - threads_per_block < 64 (线程太少, 无法隐藏延迟)
     - 需要多个 kernel launch 的配置
@@ -171,12 +173,17 @@ def _prefilter_candidates(
 
     返回过滤后的列表; 至少保留 1 个候选 (保底)。
     """
-    if baseline_lat_ms >= 0.01:
+    launch_floor_ms = getattr(config, "launch_floor_ms", 0.005) if config is not None else 0.005
+    tiny_reject_limit = getattr(config, "tiny_kernel_reject_limit", 3) if config is not None else 3
+    consecutive_rejects = run_state.consecutive_rejects() if hasattr(run_state, "consecutive_rejects") else 0
+    strict_risk_filter = tiny_reject_limit <= 0 or consecutive_rejects >= tiny_reject_limit
+
+    if baseline_lat_ms <= 0 or launch_floor_ms <= 0 or baseline_lat_ms > launch_floor_ms:
         return candidates
 
     logger.info(
-        "Prefiltering %d candidates for tiny kernel (baseline=%.4f ms)",
-        len(candidates), baseline_lat_ms,
+        "Prefiltering %d candidates for tiny kernel (baseline=%.4f ms, floor=%.4f ms, rejects=%d/%d)",
+        len(candidates), baseline_lat_ms, launch_floor_ms, consecutive_rejects, tiny_reject_limit,
     )
 
     filtered = []
@@ -194,7 +201,7 @@ def _prefilter_candidates(
             reason = "high channels_per_block with low elements_per_thread"
         elif hp.get("num_kernels", 1) > 1 or hp.get("kernel_count", 1) > 1:
             reason = "multi-kernel launch on tiny kernel"
-        elif getattr(c, "predicted_regression_risk", "medium") == "high":
+        elif strict_risk_filter and getattr(c, "predicted_regression_risk", "medium") == "high":
             reason = "self-declared high regression risk"
 
         if reason:
@@ -269,7 +276,7 @@ async def hp_search_node(self, state: dict) -> dict:
 
     # ── [改进] 预过滤明显有害的候选 ──
     best_lat = run_state.best_latency_ms() or 0.0
-    candidates = _prefilter_candidates(candidates, best_lat, run_state)
+    candidates = _prefilter_candidates(candidates, best_lat, run_state, self.sm.config)
 
     version_base = run_state.next_version_id(has_hp=True)
 
@@ -389,6 +396,173 @@ async def hp_search_node(self, state: dict) -> dict:
     hp_correctness_repair_max = getattr(
         self.sm.config, "hp_correctness_repair_max", 2
     )
+
+    ref_path = self._ref_py_path(state, self.sm.run_dir)
+    if ref_path and ref_path.exists():
+        logger.info("HP search using ref.py runner: %s", ref_path)
+
+        async def _validate_and_benchmark_ref(version_id: str, record: dict[str, Any]) -> dict[str, Any] | None:
+            cand = record["candidate"]
+            iter_dir = Path(record["iter_dir"])
+            assigned_gpu = gpu_pool.assign_gpu(cand.index)
+            current_code = record["code"]
+            code_path = Path(record["code_path"])
+            accumulated_errors: list[str] = []
+            compile_log_entries: list[str] = []
+            repair_limit = max(
+                hp_correctness_repair_max,
+                getattr(self.sm.config, "compile_repair_max_retries", 0),
+            )
+
+            for repair_attempt in range(repair_limit + 1):
+                correctness_results = await asyncio.to_thread(
+                    run_ref_correctness_multi,
+                    ref_path,
+                    code_path,
+                    self._active_shape_profiles(op),
+                    func_name=self._kernel_function_name(op),
+                    compute_capability=hw.compute_capability,
+                    dtype=dtype,
+                    gpu_id=assigned_gpu,
+                )
+                compile_ok = all(r.get("compile_ok", r.get("correct")) for r in correctness_results)
+                correctness_ok = all(r.get("correct") for r in correctness_results)
+                result_lines = []
+                for r in correctness_results:
+                    result_lines.append(
+                        f"shape={r.get('shape_label', '?')}: "
+                        f"compile_ok={r.get('compile_ok', r.get('correct'))}, "
+                        f"correct={r.get('correct')}, "
+                        f"max_abs_error={r.get('max_abs_error')}, "
+                        f"max_rel_error={r.get('max_rel_error')}, "
+                        f"message={r.get('message', '')}"
+                    )
+                compile_log_entries.append(
+                    f"[ref.py attempt {repair_attempt + 1}]\n" + "\n".join(result_lines)
+                )
+                await asyncio.to_thread(
+                    (iter_dir / "compile.log").write_text,
+                    "\n\n".join(compile_log_entries),
+                    encoding="utf-8",
+                )
+
+                if correctness_ok:
+                    if repair_attempt > 0:
+                        logger.info(
+                            "Candidate %d ref.py correctness PASSED after %d repair(s)",
+                            cand.index, repair_attempt,
+                        )
+                    break
+
+                error_details = []
+                for r in correctness_results:
+                    if not r.get("correct"):
+                        error_details.append(
+                            f"shape={r.get('shape_label', '?')}: "
+                            f"compile_ok={r.get('compile_ok', r.get('correct'))}, "
+                            f"max_abs_error={r.get('max_abs_error', '?')}, "
+                            f"max_rel_error={r.get('max_rel_error', '?')}, "
+                            f"msg={r.get('message', '?')}"
+                        )
+                error_summary = "; ".join(error_details)
+                failure_kind = "correctness" if compile_ok else "compile"
+                accumulated_errors.append(
+                    f"[ref.py {failure_kind} attempt {repair_attempt + 1}]: {error_summary}"
+                )
+                logger.warning(
+                    "Candidate %d ref.py %s failed (attempt %d/%d): %s",
+                    cand.index, failure_kind, repair_attempt + 1, repair_limit + 1,
+                    error_summary[:300],
+                )
+
+                if repair_attempt < repair_limit:
+                    try:
+                        current_code = await self._repair_code(current_code, accumulated_errors, hw)
+                    except Exception as e:
+                        logger.warning("Repair code generation failed for candidate %d: %s", cand.index, e)
+                        break
+                    code_path = await asyncio.to_thread(
+                        self.sm.persistence.save_code,
+                        current_code,
+                        iter_dir,
+                        f"code_fix{repair_attempt + 1}.cu",
+                    )
+                    record["code"] = current_code
+                    record["code_path"] = code_path
+                    continue
+
+                correctness_failure_details.append({
+                    "candidate_index": cand.index,
+                    "hyperparams": cand.hyperparams,
+                    "errors": [
+                        {
+                            "shape": r.get("shape_label", "?"),
+                            "compile_ok": r.get("compile_ok", r.get("correct")),
+                            "max_abs_error": r.get("max_abs_error"),
+                            "max_rel_error": r.get("max_rel_error"),
+                            "message": r.get("message", ""),
+                        }
+                        for r in correctness_results if not r.get("correct")
+                    ],
+                    "repair_attempts": repair_limit,
+                    "accumulated_errors": accumulated_errors,
+                })
+                return None
+
+            await asyncio.to_thread(self.sm.persistence.save_code, current_code, iter_dir)
+            code_path = iter_dir / "code.cu"
+            gpu_sem = gpu_pool.get_semaphore(assigned_gpu)
+            async with gpu_sem:
+                bm = await asyncio.to_thread(
+                    run_ref_benchmark_multi,
+                    ref_path,
+                    code_path,
+                    self._active_shape_profiles(op),
+                    func_name=self._kernel_function_name(op),
+                    compute_capability=hw.compute_capability,
+                    dtype=dtype,
+                    warmup_rounds=self.sm.config.benchmark_warmup_rounds,
+                    measure_rounds=self.sm.config.benchmark_measure_rounds,
+                    aggregator=self.sm.config.multi_shape_aggregator,
+                    gpu_id=assigned_gpu,
+                )
+            return {
+                "index": cand.index,
+                "version_id": version_id,
+                "hyperparams": cand.hyperparams,
+                "benchmark": bm,
+                "code": record["code"],
+                "iter_dir": str(iter_dir),
+            }
+
+        validate_tasks = [
+            asyncio.create_task(_validate_and_benchmark_ref(version_id, record))
+            for version_id, record in candidate_records.items()
+        ]
+        for task in asyncio.as_completed(validate_tasks):
+            try:
+                result = await task
+            except Exception as e:
+                logger.warning("ref.py validate/benchmark pipeline error: %s", e)
+                continue
+            if result is not None:
+                results.append(result)
+
+        if not results:
+            return _empty_result_with_details(correctness_failure_details)
+
+        best_cand = min(results, key=lambda r: r["benchmark"].latency_ms_median)
+        return {
+            "new_code": best_cand["code"],
+            "new_version_id": best_cand["version_id"],
+            "trial_version_id": best_cand["version_id"],
+            "trial_benchmark": best_cand["benchmark"],
+            "trial_compile_ok": True,
+            "trial_correctness_ok": True,
+            "hp_candidates": results,
+            "hp_correctness_failures": correctness_failure_details,
+            "hp_all_compiled_ok": True,
+        }
 
     async def _validate_and_benchmark(compiled: dict) -> dict[str, Any] | None:
         """单个候选的校验+benchmark流水线。"""

@@ -167,7 +167,7 @@ def _parse_benchmark_output(stdout: str) -> BenchmarkResult:
         data = next(
             (
                 obj for obj in reversed(objects)
-                if any(k in obj for k in ("latencies_ms", "latency_ms_median", "avg_ms", "latency_ms"))
+                if any(k in obj for k in ("latencies_ms", "latency_ms_median", "avg_ms", "latency_ms", "time_ms"))
             ),
             objects[-1],
         )
@@ -227,7 +227,7 @@ def _benchmark_result_from_dict(data: dict) -> BenchmarkResult:
     latencies = data.get("latencies_ms", [])
 
     if not latencies:
-        latency = data.get("latency_ms_median", data.get("avg_ms", data.get("latency_ms", 0.0)))
+        latency = data.get("latency_ms_median", data.get("avg_ms", data.get("latency_ms", data.get("time_ms", 0.0))))
         throughput = data.get("throughput_gflops")
         if throughput is None and data.get("tflops") is not None:
             throughput = data["tflops"] * 1000.0

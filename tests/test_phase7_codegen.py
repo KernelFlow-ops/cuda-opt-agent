@@ -195,3 +195,29 @@ This implements the SAXPY operation.'''
         assert result.valid is True
         assert "__global__" in code
         assert "main()" in code
+
+    def test_layernorm_ref_py_is_unified_cuda_runner(self, tmp_dir):
+        import py_compile
+
+        from cuda_opt_agent.codegen.ref_generator import generate_ref_py, ensure_executable_harness
+
+        ref_path = generate_ref_py(
+            "layernorm",
+            shape_profiles=[{"B": 1024, "N": 1024}],
+            default_dtype="fp16",
+            output_dir=tmp_dir,
+        )
+        text = ref_path.read_text(encoding="utf-8")
+
+        assert "--cuda" in text
+        assert "def compile_cuda_shared" in text
+        assert "def run_cuda_correctness" in text
+        assert "def benchmark_cuda_kernel" in text
+        assert "def _generate_cuda_inputs" in text
+        assert "does not profile PyTorch random-fill kernels" in text
+        assert "torch.nn.functional.layer_norm" in text
+        assert "int main(" not in text
+        py_compile.compile(str(ref_path), doraise=True)
+
+        code = "__global__ void layernorm_smem_tiled_kernel() {}\n"
+        assert ensure_executable_harness(code, "layernorm") == code

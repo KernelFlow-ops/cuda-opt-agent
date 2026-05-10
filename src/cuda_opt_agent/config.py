@@ -81,6 +81,16 @@ def load_config(env_path: str | Path | None = None) -> AgentConfig:
         hp_correctness_repair_max=int(os.getenv("HP_CORRECTNESS_REPAIR_MAX", "2")),
         enable_library_comparison=os.getenv("ENABLE_LIBRARY_COMPARISON", "true").strip().lower()
         in {"1", "true", "yes", "on"},
+        enable_web_search_baseline=os.getenv("ENABLE_WEB_SEARCH_BASELINE", "true").strip().lower()
+        in {"1", "true", "yes", "on"},
+        bootstrap_web_search_max_calls=int(os.getenv("BOOTSTRAP_WEB_SEARCH_MAX_CALLS", "20")),
+        bootstrap_web_search_max_results=int(os.getenv("BOOTSTRAP_WEB_SEARCH_MAX_RESULTS", "12")),
+        bootstrap_web_search_per_query_results=int(os.getenv("BOOTSTRAP_WEB_SEARCH_PER_QUERY_RESULTS", "3")),
+        web_search_on_failure_threshold=int(os.getenv("WEB_SEARCH_ON_FAILURE_THRESHOLD", "2")),
+        launch_floor_ms=float(os.getenv("LAUNCH_FLOOR_MS", "0.005")),
+        catastrophic_regression_threshold=float(os.getenv("CATASTROPHIC_REGRESSION_THRESHOLD", "3.0")),
+        catastrophic_streak_limit=int(os.getenv("CATASTROPHIC_STREAK_LIMIT", "2")),
+        tiny_kernel_reject_limit=int(os.getenv("TINY_KERNEL_REJECT_LIMIT", "3")),
     )
 
 

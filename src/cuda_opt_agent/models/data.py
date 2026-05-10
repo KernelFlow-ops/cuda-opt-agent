@@ -296,6 +296,26 @@ class AgentConfig(BaseModel):
         default=True,
         description="是否在 bootstrap 后执行 cuDNN/cuBLAS 基线对比",
     )
+    enable_web_search_baseline: bool = Field(
+        default=True,
+        description="是否在 bootstrap 阶段搜索外部参考实现",
+    )
+    bootstrap_web_search_max_calls: int = Field(
+        default=20,
+        description="bootstrap 阶段外部搜索最大调用次数; 运行时硬上限为 20",
+    )
+    bootstrap_web_search_max_results: int = Field(
+        default=12,
+        description="bootstrap 阶段最多注入 prompt 的去重搜索结果数",
+    )
+    bootstrap_web_search_per_query_results: int = Field(
+        default=3,
+        description="bootstrap 阶段每个搜索 query 请求的结果数",
+    )
+    web_search_on_failure_threshold: int = Field(
+        default=2,
+        description="连续 reject 达到该次数后触发外部知识搜索",
+    )
 
 
 # ────────────────────────────────────────────

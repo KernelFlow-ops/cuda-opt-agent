@@ -1,47 +1,75 @@
-你是一位经验丰富的 CUDA 优化工程师。请根据以下算子规格和硬件信息,编写一个**正确性优先**的 baseline CUDA kernel (v0)。
+# Bootstrap: 生成基准实现
 
-## 算子规格
-- 名称: {operator_name}
-- 签名: {signature}
-- 数据类型: {dtypes}
-- 张量形状: {shapes}
-- 多尺度 Shape Profiles: {shape_profiles}
-- 任务说明: {task_description}
-- 约束: {constraints}
+你是 CUDA 内核优化专家。请为以下算子生成**初始基准实现**。
 
-## Bootstrap 模式
 {bootstrap_mode_instruction}
 
-{seed_code_section}
+## 算子信息
+
+- **名称**: {operator_name}
+- **签名**: {signature}
+- **数据类型**: {dtypes}
+- **形状**: {shapes}
+- **Shape profiles**: {shape_profiles}
+- **任务描述**: {task_description}
 
 ## 硬件信息
+
 - GPU: {gpu_name}
-- 计算能力: {compute_capability}
-- SM 数量: {sm_count}
-- 每 Block 共享内存: {shared_mem_per_block_kb} KB
+- Compute capability: {compute_capability}
+- SM count: {sm_count}
+- Shared memory/block: {shared_mem_per_block_kb} KB
 - L2 Cache: {l2_cache_mb} MB
 - Tensor Cores: {has_tensor_cores}
-- CUDA 版本: {cuda_version}
+- CUDA version: {cuda_version}
 
 {kb_hints_section}
 
-## 要求
-1. **正确性优先**:此版本不需要快,只需保证数值正确。后续迭代会逐步优化性能。
-2. 必须包含完整可编译的 .cu 文件,包括:
-   - 必要的 #include
-   - __global__ kernel 函数
-   - 用于正确性校验的 host 端 reference 实现(CPU 版本)
-   - main() 函数,包含:
-     a) 内存分配与数据初始化(随机数据)
-     b) 调用 kernel
-     c) 与 reference 比较(输出 JSON 格式的校验结果)
-     d) cudaEvent 计时(输出 JSON 格式的 benchmark 结果)
-   - 支持命令行参数: --check (只做校验) / --shape key=value [key=value ...] / --warmup N / --rounds N / --atol F / --rtol F
-3. 使用简单直接的实现,避免不必要的复杂优化
-4. 对边界条件做正确处理
-5. `--check` 必须快速完成且有代表性: kernel 必须在用户请求的完整 shape 上运行,然后抽样若干输出元素并只为这些元素计算 CPU reference；不要把 reduced/small shape 作为唯一正确性依据。
-6. 校验 JSON 必须包含字段: `correct`, `max_abs_error`, `max_rel_error`, `message`。
-7. Benchmark JSON 必须包含字段: `latency_ms_median`, `latency_ms_p95`, `throughput_gflops`; 或输出 `latencies_ms` 数组。
-8. 不要硬编码单一尺寸；必须解析 `--shape` 后面的键值对,例如 `--shape M=4096 N=4096 K=4096` 或 `--shape B=4096 N=4096`。如果值是多维张量形状,例如 `x=1024,1024`,需要按逗号解析。
+{seed_code_section}
 
-请直接输出完整的 .cu 代码,用 ```cuda 包裹。之后附一段简短自述(50字以内)说明你的实现思路。
+{external_reference}
+
+## 要求
+
+### 1. CUDA Kernel 代码
+
+生成一个**正确**的 CUDA kernel 实现，满足:
+- 代码完整可编译（包含所有必要的 #include）
+- 正确性优先；v0 baseline 必须先保证可编译和数值正确，再考虑性能
+- 数值正确性（结果与 PyTorch 参考一致，误差在 atol=1e-2, rtol=1e-2 以内）
+- **必须包含 `extern "C"` 入口点函数**，函数签名为:
+  ```c
+  extern "C" void {operator_name}_kernel({extern_c_params})
+  ```
+- 入口点函数内部调用实际的 CUDA kernel，配置好 grid/block 参数
+- 不要提供 `int main`、CPU 参考实现、命令行解析或 JSON benchmark harness；正确性和测速由生成的 `ref.py` 统一负责
+- 这是初始基准版本，不需要极致优化，但应该是合理的基础实现
+
+### 2. 代码结构规范
+
+```cuda
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+// ... other includes
+
+// 实际的 CUDA kernel
+__global__ void {operator_name}_kernel_impl(...) {{
+    // kernel implementation
+}}
+
+// extern "C" 入口点（统一 benchmark 接口）
+extern "C" void {operator_name}_kernel({extern_c_params}) {{
+    // 配置 grid, block
+    dim3 block(...);
+    dim3 grid(...);
+    {operator_name}_kernel_impl<<<grid, block>>>(...);
+}}
+```
+
+### 3. 约束
+
+{constraints}
+
+## 输出格式
+
+只输出完整的 .cu 代码，不要有多余的解释。代码块以 ```cuda 开始，``` 结束。

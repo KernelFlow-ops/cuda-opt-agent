@@ -187,10 +187,32 @@ That's my recommendation.'''
                 yield '{"ok":'
                 yield ' true}'
 
-        client = LLMClient()
+        client = LLMClient(use_tool_use=False)
         monkeypatch.setattr(client, "_get_llm", lambda temperature=None: FakeLLM())
 
         assert run_async(client.ainvoke_json("prompt", temperature=0.8, node_name="decide")) == {"ok": True}
+
+    def test_ainvoke_json_uses_tool_use_when_enabled(self, monkeypatch):
+        from cuda_opt_agent.agent.llm_client import LLMClient
+
+        seen = {}
+
+        class FakeStructuredLLM:
+            async def ainvoke(self, prompt):
+                seen["prompt"] = prompt
+                return {"payload": {"ok": True}}
+
+        class FakeLLM:
+            def with_structured_output(self, schema):
+                seen["schema"] = schema
+                return FakeStructuredLLM()
+
+        client = LLMClient(use_tool_use=True)
+        monkeypatch.setattr(client, "_get_llm", lambda temperature=None: FakeLLM())
+
+        assert run_async(client.ainvoke_json("prompt", temperature=0.8, node_name="decide")) == {"ok": True}
+        assert seen["prompt"] == "prompt"
+        assert seen["schema"].__name__ == "_JSONToolPayload"
 
     def test_openai_client_uses_responses_api(self, monkeypatch):
         from cuda_opt_agent.agent.llm_client import LLMClient

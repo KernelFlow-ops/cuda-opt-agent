@@ -221,6 +221,37 @@ int main() { return 0; }
         assert "bottlenecks" in result["analysis_result"]
         assert llm.ainvoke_json.call_args.kwargs["temperature"] == 0.1
 
+    def test_analyze_node_updates_kernel_regime_from_launch_floor(
+        self,
+        sample_agent_config,
+        sample_operator_spec,
+        sample_hardware_spec,
+        sample_run_state,
+        sample_ncu_metrics,
+        sample_benchmark_result,
+    ):
+        config = sample_agent_config.model_copy(update={"launch_floor_ms": 2.0})
+        nodes, sm, llm = self._make_nodes(config)
+        sm.state = sample_run_state
+        sample_run_state.config = config
+        llm.format_prompt.return_value = "test prompt"
+        llm.ainvoke_json.return_value = {"bottlenecks": []}
+
+        state: GraphState = {
+            "operator_spec": sample_operator_spec,
+            "hardware_spec": sample_hardware_spec,
+            "run_state": sample_run_state,
+            "current_ncu": sample_ncu_metrics,
+            "current_benchmark": sample_benchmark_result,
+            "current_code": "__global__ void k() {}",
+        }
+
+        run_async(nodes.analyze_node(state))
+
+        assert sample_run_state.kernel_regime["regime"] == "tiny_kernel"
+        assert sample_run_state.kernel_regime["near_launch_floor"] is True
+        assert sample_run_state.kernel_regime["launch_floor_ms"] == 2.0
+
     def test_profile_args_use_ncu_config(self, sample_agent_config):
         config = sample_agent_config.model_copy(update={
             "ncu_warmup_rounds": 3,
@@ -271,6 +302,45 @@ int main() { return 0; }
 
         assert result["current_ncu"] == ncu
         assert mock_profile.call_args.kwargs["launch_count"] == 7
+
+    def test_profile_best_ref_runner_filters_target_kernel(self, sample_agent_config,
+                                                            sample_operator_spec,
+                                                            sample_hardware_spec,
+                                                            sample_iteration_record):
+        nodes, sm, _ = self._make_nodes(sample_agent_config)
+        sm.state = RunState(
+            run_id="test_run",
+            operator_spec=sample_operator_spec,
+            hardware_spec=sample_hardware_spec,
+            iterations=[sample_iteration_record],
+            current_best_id="v0",
+            config=sample_agent_config,
+        )
+        sm.run_dir = sm.persistence.create_run_dir("test")
+        iter_dir = sm.run_dir / "iterv0"
+        iter_dir.mkdir(parents=True, exist_ok=True)
+        code_path = iter_dir / "code.cu"
+        code_path.write_text("extern \"C\" void gemm_kernel() {}", encoding="utf-8")
+        ref_path = sm.run_dir / "ref.py"
+        ref_path.write_text("# ref runner", encoding="utf-8")
+
+        state: GraphState = {
+            "operator_spec": sample_operator_spec,
+            "hardware_spec": sample_hardware_spec,
+            "run_state": sm.state,
+            "ref_py_path": str(ref_path),
+        }
+        bm = BenchmarkResult(latency_ms_median=1.0, latency_ms_p95=1.1, extra={"worst_shape": {}})
+        ncu = NcuMetrics(sm_throughput_pct=10.0)
+
+        with patch("cuda_opt_agent.agent.nodes.profile.run_ref_benchmark_multi", return_value=bm), \
+             patch("cuda_opt_agent.agent.nodes.profile.run_ncu_profile", return_value=ncu) as mock_profile:
+            result = run_async(nodes.profile_best_node(state))
+
+        assert result["current_ncu"] == ncu
+        assert mock_profile.call_args.kwargs["kernel_name"] == "regex:.*gemm.*"
+        assert mock_profile.call_args.kwargs["extra_args"] == ["--kernel-name-base", "demangled"]
+        assert str(ref_path) in mock_profile.call_args.kwargs["executable_args"]
 
     def test_decide_node_normal(self, sample_agent_config, sample_operator_spec,
                                       sample_hardware_spec, sample_run_state,
@@ -432,10 +502,10 @@ int main() { return 0; }
         assert "tiling" in llm.format_prompt.call_args_list[1].kwargs["rejected_methods"]
 
     def test_decide_node_falls_back_after_reselect_retries_exhausted(self,
-                                                                          sample_agent_config,
-                                                                          sample_operator_spec,
-                                                                          sample_hardware_spec,
-                                                                          sample_run_state,
+                                                                           sample_agent_config,
+                                                                           sample_operator_spec,
+                                                                           sample_hardware_spec,
+                                                                           sample_run_state,
                                                                           sample_benchmark_result):
         config = sample_agent_config.model_copy(update={"decide_reselect_max_retries": 2})
         nodes, sm, llm = self._make_nodes(config)
@@ -469,10 +539,41 @@ int main() { return 0; }
         assert result["method_decision"].method_name.startswith("forced_continue_")
         assert llm.ainvoke_json.call_count == 3
 
+    def test_hp_prefilter_uses_launch_floor_and_tiny_reject_limit(
+        self,
+        sample_agent_config,
+        sample_run_state,
+    ):
+        from cuda_opt_agent.agent.nodes.hp_search import _prefilter_candidates
+        from cuda_opt_agent.models.data import HyperparamCandidate
+
+        config = sample_agent_config.model_copy(update={
+            "launch_floor_ms": 0.5,
+            "tiny_kernel_reject_limit": 2,
+        })
+        sample_run_state.iterations.extend([
+            IterationRecord(version_id="v1", accepted=False, compile_ok=True, correctness_ok=True),
+            IterationRecord(version_id="v2", accepted=False, compile_ok=True, correctness_ok=True),
+        ])
+        high_risk = HyperparamCandidate(
+            index=0,
+            hyperparams={"threads_per_block": 128},
+            predicted_regression_risk="high",
+        )
+        safe = HyperparamCandidate(
+            index=1,
+            hyperparams={"threads_per_block": 128},
+            predicted_regression_risk="low",
+        )
+
+        kept = _prefilter_candidates([high_risk, safe], 0.4, sample_run_state, config)
+
+        assert [cand.index for cand in kept] == [1]
+
     def test_hp_search_compiles_all_candidates_before_gpu_work(self, sample_agent_config,
-                                                                     sample_operator_spec,
-                                                                     sample_hardware_spec,
-                                                                     sample_run_state):
+                                                                      sample_operator_spec,
+                                                                      sample_hardware_spec,
+                                                                      sample_run_state):
         config = sample_agent_config.model_copy(update={"hp_compile_workers": 1})
         nodes, sm, llm = self._make_nodes(config)
         sm.state = sample_run_state
@@ -624,6 +725,60 @@ int main() { return 0; }
         assert "repaired" in (iter_dir / "code.cu").read_text(encoding="utf-8")
         assert (iter_dir / "kernel").exists()
         assert "bad generated code" in (iter_dir / "compile.log").read_text(encoding="utf-8")
+
+    def test_hp_search_uses_ref_runner_when_available(self, sample_agent_config,
+                                                       sample_operator_spec,
+                                                       sample_hardware_spec,
+                                                       sample_run_state):
+        config = sample_agent_config.model_copy(update={"hp_compile_workers": 1})
+        nodes, sm, llm = self._make_nodes(config)
+        sm.state = sample_run_state
+        sm.run_dir = sm.persistence.create_run_dir("test")
+        ref_path = sm.run_dir / "ref.py"
+        ref_path.write_text("# generated ref runner\n", encoding="utf-8")
+
+        llm.format_prompt.return_value = "prompt"
+        llm.ainvoke_json.return_value = [
+            {"index": 0, "hyperparams": {"tile": 64}, "rationale": "safe"},
+        ]
+        llm.ainvoke.return_value = "```cuda\nextern \"C\" void gemm_kernel() {}\n```"
+        events = []
+
+        def fake_ref_correctness(ref, code, shape_profiles, **kwargs):
+            events.append(("ref_check", Path(code).name, kwargs["func_name"]))
+            return [{"correct": True, "compile_ok": True, "message": "ok"}]
+
+        def fake_ref_benchmark(ref, code, shape_profiles, **kwargs):
+            events.append(("ref_bench", Path(code).name, kwargs["func_name"]))
+            return BenchmarkResult(latency_ms_median=0.8, latency_ms_p95=0.9)
+
+        state: GraphState = {
+            "operator_spec": sample_operator_spec,
+            "hardware_spec": sample_hardware_spec,
+            "run_state": sample_run_state,
+            "current_ncu": NcuMetrics(),
+            "current_code": "extern \"C\" void gemm_kernel() {}",
+            "ref_py_path": str(ref_path),
+            "method_decision": MethodDecision(
+                method_name="tiling",
+                has_hyperparams=True,
+                hyperparams_schema={"tile": {"type": "int"}},
+            ),
+        }
+
+        with patch("cuda_opt_agent.agent.nodes._helpers.compile_cuda") as mock_compile, \
+             patch("cuda_opt_agent.agent.nodes.hp_search.run_ref_correctness_multi", side_effect=fake_ref_correctness), \
+             patch("cuda_opt_agent.agent.nodes.hp_search.run_ref_benchmark_multi", side_effect=fake_ref_benchmark):
+            result = run_async(nodes.hp_search_node(state))
+
+        mock_compile.assert_not_called()
+        assert events == [
+            ("ref_check", "code.cu", "gemm_kernel"),
+            ("ref_bench", "code.cu", "gemm_kernel"),
+        ]
+        assert result["trial_compile_ok"] is True
+        assert result["trial_correctness_ok"] is True
+        assert result["trial_benchmark"].latency_ms_median == 0.8
 
     def test_hp_search_handles_absolute_output_path_for_canonical_kernel(
         self,

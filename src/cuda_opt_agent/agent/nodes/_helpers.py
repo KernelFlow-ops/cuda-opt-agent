@@ -218,6 +218,19 @@ def _active_shape_profiles(op) -> list[dict]:
     return [{}]
 
 
+def _ref_py_path(state: dict | None, run_dir: Path | None) -> Path | None:
+    """Resolve the generated ref.py path for unified CUDA evaluation."""
+    if state and state.get("ref_py_path"):
+        return Path(state["ref_py_path"])
+    if run_dir is not None:
+        return Path(run_dir) / "ref.py"
+    return None
+
+
+def _kernel_function_name(op) -> str:
+    return f"{op.name}_kernel"
+
+
 def _benchmark_multi(self, exe_path: Path, op, gpu_id: int | None = None) -> BenchmarkResult:
     """[优化] 支持 gpu_id 参数。"""
     return run_benchmark_multi(

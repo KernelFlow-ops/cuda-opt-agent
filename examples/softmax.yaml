@@ -1,0 +1,21 @@
+name: softmax
+signature: "Y = softmax(X, dim=-1)"
+description: "Row-wise softmax: Y[i][j] = exp(X[i][j]) / sum(exp(X[i]))"
+dtypes:
+  default: fp16
+shapes:
+  B: 2048
+  N: 2048
+constraints:
+  - "Support arbitrary N values"
+  - "Numerically stable: use max-subtraction trick"
+shape_profiles:
+  - B: 1024
+    N: 512
+    _weight: 0.3
+  - B: 2048
+    N: 2048
+    _weight: 0.5
+  - B: 4096
+    N: 8192
+    _weight: 0.2

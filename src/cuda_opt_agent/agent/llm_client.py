@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 
+from pydantic import BaseModel, Field
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,10 @@ logger = logging.getLogger(__name__)
 # Prompt 模板目录
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 DEFAULT_TEMPERATURE = 0.3
+
+
+class _JSONToolPayload(BaseModel):
+    payload: Any = Field(description="The exact JSON object or array requested by the prompt.")
 
 
 class LLMStreamSink(Protocol):
@@ -89,10 +94,12 @@ class LLMClient:
         provider: str = "anthropic",
         model: str = "claude-sonnet-4-20250514",
         stream_sink: LLMStreamSink | None = None,
+        use_tool_use: bool = True,
     ):
         self.provider = provider
         self.model = model
         self.stream_sink = stream_sink
+        self.use_tool_use = use_tool_use
         self._llm_cache: dict[float, Any] = {}
 
     def _get_llm(self, temperature: float | None = None):
@@ -206,7 +213,7 @@ class LLMClient:
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=30))
     def invoke_structured(self, prompt: str, schema: type, temperature: float | None = None) -> Any:
         """调用 LLM 并解析结构化输出。"""
-        if self.provider == "openai":
+        if not self.use_tool_use or self.provider == "openai":
             text = self.invoke(prompt) if temperature is None else self.invoke(prompt, temperature=temperature)
             return self._manual_parse(text, schema)
 
@@ -235,6 +242,14 @@ class LLMClient:
         stream_sink: LLMStreamSink | None = None,
     ) -> Any:
         """Async structured output via streamed raw text followed by schema parsing."""
+        if self.use_tool_use:
+            return await self.ainvoke_tool_use(
+                prompt,
+                schema,
+                temperature=temperature,
+                node_name=node_name,
+                stream_sink=stream_sink,
+            )
         text = await self.ainvoke(
             prompt,
             temperature=temperature,
@@ -252,6 +267,28 @@ class LLMClient:
         stream_sink: LLMStreamSink | None = None,
     ) -> dict:
         """Async LLM call with streamed raw output followed by JSON parsing."""
+        if self.use_tool_use:
+            try:
+                llm = self._get_llm(temperature)
+                sink = stream_sink if stream_sink is not None else self.stream_sink
+                if sink is not None and node_name:
+                    await _maybe_call(sink, "start_node", node_name)
+                structured_llm = llm.with_structured_output(_JSONToolPayload)
+                result = await structured_llm.ainvoke(prompt)
+                if sink is not None and node_name:
+                    await _maybe_call(sink, "finish_node", "tool_use JSON OK")
+                if isinstance(result, _JSONToolPayload):
+                    return result.payload
+                if isinstance(result, dict) and "payload" in result:
+                    return result["payload"]
+                if hasattr(result, "payload"):
+                    return result.payload
+                return result
+            except Exception as e:
+                logger.warning(
+                    "Tool Use JSON failed for %s; falling back to text JSON parsing: %s",
+                    node_name or "unknown", e,
+                )
         text = await self.ainvoke(
             prompt,
             temperature=temperature,

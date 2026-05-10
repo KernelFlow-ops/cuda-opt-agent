@@ -11,6 +11,7 @@ import asyncio
 import logging
 
 from ...models.data import BenchmarkResult
+from ...tools.ref_eval import run_ref_benchmark_multi
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,7 @@ async def evaluate_node(self, state: dict) -> dict:
     """评估 v★ 是否优于 best。"""
     logger.info("=== EVALUATE ===")
     run_state = state["run_state"]
+    hw = state["hardware_spec"]
     epsilon = self.sm.config.accept_epsilon
 
     version_id = state.get("new_version_id", "")
@@ -53,8 +55,25 @@ async def evaluate_node(self, state: dict) -> dict:
             }
 
         iter_dir = self.sm.run_dir / f"iter{version_id}"
-        exe_path = self._kernel_executable(iter_dir)
-        trial_bm = await asyncio.to_thread(self._benchmark_multi, exe_path, run_state.operator_spec)
+        ref_path = self._ref_py_path(state, self.sm.run_dir)
+        if ref_path and ref_path.exists():
+            op = run_state.operator_spec
+            dtype = list(op.dtypes.values())[0] if op.dtypes else "fp32"
+            trial_bm = await asyncio.to_thread(
+                run_ref_benchmark_multi,
+                ref_path,
+                iter_dir / "code.cu",
+                self._active_shape_profiles(op),
+                func_name=self._kernel_function_name(op),
+                compute_capability=hw.compute_capability,
+                dtype=dtype,
+                warmup_rounds=self.sm.config.benchmark_warmup_rounds,
+                measure_rounds=self.sm.config.benchmark_measure_rounds,
+                aggregator=self.sm.config.multi_shape_aggregator,
+            )
+        else:
+            exe_path = self._kernel_executable(iter_dir)
+            trial_bm = await asyncio.to_thread(self._benchmark_multi, exe_path, run_state.operator_spec)
         trial_compile_ok = result.get("trial_compile_ok", False)
         trial_correctness_ok = result.get("trial_correctness_ok", False)
 

@@ -16,9 +16,24 @@ from ...codegen.normalizer import extract_cuda_code
 from ...models.data import IterationRecord
 from ...tools.compile import compile_cuda
 from ...tools.correctness import check_correctness_multi_async, summarize_correctness_results
+from ...tools.ref_eval import run_ref_correctness_multi
 from ..temperatures import TEMP_REPAIR
 
 logger = logging.getLogger(__name__)
+
+
+def _format_correctness_log(results: list[dict]) -> str:
+    lines = []
+    for result in results:
+        lines.append(
+            f"{result.get('shape_label', 'shape')}: "
+            f"correct={result.get('correct')} "
+            f"compile_ok={result.get('compile_ok', result.get('correct'))} "
+            f"max_abs={result.get('max_abs_error')} "
+            f"max_rel={result.get('max_rel_error')} "
+            f"message={result.get('message', '')}"
+        )
+    return "\n".join(lines)
 
 
 async def compile_and_validate_node(self, state: dict) -> dict:
@@ -46,8 +61,51 @@ async def compile_and_validate_node(self, state: dict) -> dict:
     # [优化] 累积所有错误信息, 让 LLM 看到完整的失败历史
     accumulated_errors: list[str] = []
     compile_log_entries: list[str] = []
+    ref_path = self._ref_py_path(state, self.sm.run_dir)
+    use_ref_runner = bool(ref_path and ref_path.exists())
 
     for attempt in range(max_retries + 1):
+        if use_ref_runner:
+            dtype = list(op.dtypes.values())[0] if op.dtypes else "fp32"
+            correctness_results = await asyncio.to_thread(
+                run_ref_correctness_multi,
+                ref_path,
+                code_path,
+                self._active_shape_profiles(op),
+                func_name=self._kernel_function_name(op),
+                compute_capability=hw.compute_capability,
+                dtype=dtype,
+            )
+            compile_ok = all(r.get("compile_ok", r.get("correct")) for r in correctness_results)
+            correctness_ok = all(r.get("correct") for r in correctness_results)
+            compile_log_entries.append(
+                f"[Attempt {attempt + 1} - ref.py {'passed' if correctness_ok else 'failed'}]\n"
+                f"{_format_correctness_log(correctness_results)}"
+            )
+            await asyncio.to_thread(
+                (iter_dir / "compile.log").write_text,
+                "\n\n".join(compile_log_entries),
+                encoding="utf-8",
+            )
+            if correctness_ok:
+                break
+
+            message = summarize_correctness_results(correctness_results)
+            failure_kind = "Correctness failed" if compile_ok else "Compile failed"
+            logger.warning("%s (attempt %d): %s", failure_kind, attempt, message)
+            accumulated_errors.append(
+                f"[Attempt {attempt + 1} - {failure_kind}]: {message}"
+            )
+            if attempt < max_retries:
+                code = await self._repair_code(code, accumulated_errors, hw)
+                code_path = await asyncio.to_thread(
+                    self.sm.persistence.save_code,
+                    code,
+                    iter_dir,
+                    f"code_fix{attempt + 1}.cu",
+                )
+            continue
+
         cr = await asyncio.to_thread(
             compile_cuda,
             code_path,

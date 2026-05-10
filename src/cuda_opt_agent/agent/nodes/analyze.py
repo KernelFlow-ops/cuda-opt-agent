@@ -32,6 +32,25 @@ async def analyze_node(self, state: dict) -> dict:
     ncu_text = format_ncu_for_prompt(ncu)
 
     bm = state.get("current_benchmark", BenchmarkResult())
+    cfg = getattr(self.sm, "config", None) or getattr(run_state, "config", None)
+    launch_floor_ms = getattr(cfg, "launch_floor_ms", 0.005) if cfg else 0.005
+    latency_ms = bm.latency_ms_median if bm.latency_ms_median > 0 else None
+    near_launch_floor = bool(latency_ms is not None and launch_floor_ms > 0 and latency_ms <= launch_floor_ms)
+    kernel_regime = {
+        "regime": "tiny_kernel" if near_launch_floor else "normal_kernel",
+        "latency_ms": latency_ms,
+        "launch_floor_ms": launch_floor_ms,
+        "near_launch_floor": near_launch_floor,
+    }
+    if getattr(run_state, "kernel_regime", {}) != kernel_regime:
+        if self.sm and getattr(self.sm, "state", None) is run_state:
+            self.sm.update_kernel_regime(kernel_regime)
+        else:
+            run_state.kernel_regime = kernel_regime
+        logger.info(
+            "Analyze: kernel regime=%s latency=%s launch_floor_ms=%.4f",
+            kernel_regime["regime"], latency_ms, launch_floor_ms,
+        )
     bm_text = (
         f"latency_median: {bm.latency_ms_median:.4f} ms\n"
         f"latency_p95: {bm.latency_ms_p95:.4f} ms\n"

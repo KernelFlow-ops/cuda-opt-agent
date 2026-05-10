@@ -3,6 +3,7 @@ Phase 1 测试 —— 数据模型 + 工具层。
 不依赖 GPU 和 LLM API,纯单元测试。
 """
 
+import asyncio
 import json
 import pytest
 from pathlib import Path
@@ -509,6 +510,83 @@ class TestCorrectnessTool:
         assert calls[0] == ["--shape", "B=1024", "N=1024"]
         assert calls[1] == ["--shape", "B=4096", "N=4096"]
 
+    def test_ref_correctness_multi_passes_shape_args(self, monkeypatch, tmp_dir):
+        import cuda_opt_agent.tools.ref_eval as ref_eval
+
+        ref = tmp_dir / "ref.py"
+        code = tmp_dir / "code.cu"
+        ref.write_text("", encoding="utf-8")
+        code.write_text("", encoding="utf-8")
+        calls = []
+
+        class Result:
+            returncode = 0
+            stdout = json.dumps({
+                "correct": True,
+                "passed": True,
+                "compile_ok": True,
+                "max_abs_error": 0.0,
+                "max_rel_error": 0.0,
+            })
+            stderr = ""
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return Result()
+
+        monkeypatch.setattr(ref_eval.subprocess, "run", fake_run)
+        results = ref_eval.run_ref_correctness_multi(
+            ref,
+            code,
+            [{"B": 1024, "N": 1024}, {"B": 4096, "N": 4096}],
+            func_name="layernorm_kernel",
+            compute_capability="sm_80",
+            dtype="fp16",
+        )
+
+        assert all(r["correct"] for r in results)
+        assert all(r["compile_ok"] for r in results)
+        assert calls[0][-3:] == ["--shape", "B=1024", "N=1024"]
+        assert calls[1][-3:] == ["--shape", "B=4096", "N=4096"]
+
+    def test_ref_benchmark_multi_aggregates_shape_args(self, monkeypatch, tmp_dir):
+        import cuda_opt_agent.tools.ref_eval as ref_eval
+
+        ref = tmp_dir / "ref.py"
+        code = tmp_dir / "code.cu"
+        ref.write_text("", encoding="utf-8")
+        code.write_text("", encoding="utf-8")
+        calls = []
+
+        class Result:
+            returncode = 0
+            stdout = json.dumps({
+                "latency_ms_median": 2.0,
+                "latency_ms_p95": 2.5,
+                "compile_ok": True,
+            })
+            stderr = ""
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return Result()
+
+        monkeypatch.setattr(ref_eval.subprocess, "run", fake_run)
+        result = ref_eval.run_ref_benchmark_multi(
+            ref,
+            code,
+            [{"B": 1024, "N": 1024}, {"B": 2048, "N": 2048}],
+            func_name="layernorm_kernel",
+            compute_capability="sm_80",
+            dtype="fp16",
+            aggregator="worst",
+        )
+
+        assert result.latency_ms_median == 2.0
+        assert result.extra["shape_count"] == 2
+        assert "--benchmark" in calls[0]
+        assert calls[0][-3:] == ["--shape", "B=1024", "N=1024"]
+
 
 class TestHardwareTool:
     def test_nvcc_version_no_nvcc(self, monkeypatch):
@@ -524,3 +602,74 @@ class TestHardwareTool:
         assert _query_sm_count_fallback("sm_86", "NVIDIA GeForce RTX 3060") == 28
         assert _query_sm_count_fallback("sm_86") == 0
         assert _query_sm_count_fallback("sm_99") == 0
+
+
+class TestWebSearchTool:
+    def test_baseline_reference_search_hard_caps_exa_calls(self, monkeypatch):
+        import cuda_opt_agent.tools.web_search as web_search
+
+        calls = []
+
+        class FakeExa:
+            api_key = "test-key"
+
+            async def search(self, query, *, num_results=5, include_domains=None):
+                calls.append((query, num_results, include_domains))
+                return [{
+                    "title": f"result {len(calls)}",
+                    "url": f"https://example.com/{len(calls)}",
+                    "text": "reference",
+                }]
+
+        class FakeWeb:
+            async def search(self, query, num_results=5):
+                raise AssertionError("fallback should not be used when Exa is configured")
+
+        monkeypatch.setattr(web_search, "ExaSearchClient", lambda: FakeExa())
+        monkeypatch.setattr(web_search, "WebSearchFallback", lambda: FakeWeb())
+
+        results = asyncio.run(web_search.search_for_baseline_reference(
+            "layernorm",
+            dtype="fp16",
+            max_calls=50,
+            max_results=100,
+            per_query_results=1,
+            task_description="写一个 fp16 layernorm",
+            shapes={"x": [1024, 1024]},
+            hardware_context="NVIDIA A100 sm_80",
+        ))
+
+        assert len(calls) == 20
+        assert len(results) == 20
+        assert all(call[1] == 1 for call in calls)
+        assert any("layernorm" in call[0] for call in calls)
+
+    def test_baseline_reference_search_stops_after_sufficient_phase_results(self, monkeypatch):
+        import cuda_opt_agent.tools.web_search as web_search
+
+        calls = []
+
+        class FakeExa:
+            api_key = "test-key"
+
+            async def search(self, query, *, num_results=5, include_domains=None):
+                calls.append(query)
+                base = len(calls) * 10
+                return [
+                    {"title": f"r{base + i}", "url": f"https://example.com/{base + i}", "text": "reference"}
+                    for i in range(num_results)
+                ]
+
+        monkeypatch.setattr(web_search, "ExaSearchClient", lambda: FakeExa())
+        monkeypatch.setattr(web_search, "WebSearchFallback", lambda: object())
+
+        results = asyncio.run(web_search.search_for_baseline_reference(
+            "softmax",
+            dtype="fp16",
+            max_calls=20,
+            max_results=5,
+            per_query_results=2,
+        ))
+
+        assert len(calls) == 6
+        assert len(results) == 5

@@ -202,11 +202,42 @@ class TestConfig:
         config = load_config(tmp_dir / "nonexistent.env")
         assert config.max_iterations == 30
         assert config.llm_provider == "anthropic"
+        assert config.enable_web_search_baseline is True
+        assert config.bootstrap_web_search_max_calls == 20
+        assert config.bootstrap_web_search_max_results == 12
+        assert config.bootstrap_web_search_per_query_results == 3
+        assert config.web_search_on_failure_threshold == 2
+        assert config.launch_floor_ms == 0.005
+        assert config.catastrophic_regression_threshold == 3.0
+        assert config.catastrophic_streak_limit == 2
+        assert config.tiny_kernel_reject_limit == 3
 
     def test_load_from_env_file(self, tmp_dir):
         env_file = tmp_dir / ".env"
-        env_file.write_text("MAX_ITERATIONS=50\nLLM_PROVIDER=openai\n", encoding="utf-8")
+        env_file.write_text(
+            "MAX_ITERATIONS=50\n"
+            "LLM_PROVIDER=openai\n"
+            "ENABLE_WEB_SEARCH_BASELINE=false\n"
+            "BOOTSTRAP_WEB_SEARCH_MAX_CALLS=11\n"
+            "BOOTSTRAP_WEB_SEARCH_MAX_RESULTS=9\n"
+            "BOOTSTRAP_WEB_SEARCH_PER_QUERY_RESULTS=4\n"
+            "WEB_SEARCH_ON_FAILURE_THRESHOLD=4\n"
+            "LAUNCH_FLOOR_MS=0.02\n"
+            "CATASTROPHIC_REGRESSION_THRESHOLD=4.5\n"
+            "CATASTROPHIC_STREAK_LIMIT=6\n"
+            "TINY_KERNEL_REJECT_LIMIT=7\n",
+            encoding="utf-8",
+        )
 
         from cuda_opt_agent.config import load_config
         config = load_config(str(env_file))
         assert config.max_iterations == 50
+        assert config.enable_web_search_baseline is False
+        assert config.bootstrap_web_search_max_calls == 11
+        assert config.bootstrap_web_search_max_results == 9
+        assert config.bootstrap_web_search_per_query_results == 4
+        assert config.web_search_on_failure_threshold == 4
+        assert config.launch_floor_ms == 0.02
+        assert config.catastrophic_regression_threshold == 4.5
+        assert config.catastrophic_streak_limit == 6
+        assert config.tiny_kernel_reject_limit == 7
